@@ -1,0 +1,116 @@
+# Qwen/Qwen3.8-27B-FP8 recipe (arch qwen3_5).
+#
+# Audited from config.json + model.safetensors.index.json + safetensors
+# headers (see docs/design/05-audit-qwen3-5.md). Dense MLP (gate/up/down),
+# FP8 e4m3 with per-128x128-block inverse scales (weight_scale_inv), dynamic
+# activation quantization. Linear attention = GatedDeltaNet (gated delta rule,
+# FLA-style), NOT a Mamba selective scan.
+
+recipe_version: "1"
+name: Qwen3.8-27B-FP8
+description: sLLM native serving of Qwen/Qwen3.8-27B-FP8 (fp8 e4m3, GatedDeltaNet + paged attention + MTP)
+
+model_id: Qwen/Qwen3.8-27B-FP8
+arch: qwen3_5
+# partial = recipe audited and the fp8 loader/sharding verified against real
+# headers, but the executable engine path for the REAL checkpoint is gated
+# (serving/main.py _build_engine). "ready" is reserved for end-to-end runnable
+# models (Qwen2.5-Coder-0.5B).
+status: partial
+dtype: bfloat16
+
+quant:
+  method: fp8
+  fmt: e4m3
+  activation: dynamic
+  weight_block_size: [128, 128]
+  scale_tensor_suffix: weight_scale_inv
+  modules_not_quantize: ["model.embed_tokens", "lm_head", "mtp.fc"]
+
+text:
+  hidden_size: 5120
+  num_layers: 64
+  full_attention_interval: 4
+  # layer_types below is derived (L x3 + F, 16 times) and matches the
+  # checkpoint: 48 linear_attention + 16 full_attention.
+  linear_attention:
+    kernel: gated_delta_rule
+    num_key_heads: 16
+    key_head_dim: 128
+    num_value_heads: 48
+    value_head_dim: 128
+    conv_kernel_size: 4
+    state_dtype: float32
+    qk_l2norm: true
+    q_scaling: head_k_dim^-0.5
+  full_attention:
+    kernel: paged_flash
+    num_heads: 24
+    num_kv_heads: 4
+    head_dim: 256
+    output_gate: true
+    rope:
+      type: mrope
+      theta: 10000000
+      mrope_section: [11, 11, 10]
+      mrope_interleaved: true
+      partial_rotary_factor: 0.25
+  mlp:
+    type: dense
+    intermediate_size: 17408
+    hidden_act: silu
+  vocab_size: 248320
+  max_position_embeddings: 262144
+  rms_norm_eps: 1e-6
+
+mtp:
+  enabled: true
+  layers: 1
+  attention_type: full
+  has_fc: true
+
+vision:
+  enabled: true
+  depth: 27
+  hidden_size: 1152
+  num_heads: 16
+  patch_size: 16
+  temporal_patch_size: 2
+  spatial_merge_size: 2
+  intermediate_size: 4304
+  num_position_embeddings: 2304
+  out_hidden_size: 5120
+
+tp:
+  size: 2
+  shard_axes:
+    column_parallel: [qkv, gate_up]
+    row_parallel: [o_proj, down_proj]
+
+paths:
+  local_dir: ~/models/Qwen3.8-27B-FP8
+
+# ---- launch (consumed by the `sllm` launcher; CLI flags win) ---------------
+container: sllm-node:latest
+
+defaults:
+  # NOTE: max_*/kv_utilization are planning values; engine admission
+  # wiring lands with the C-phase GPU executor.
+  host: 0.0.0.0
+  port: 8002
+  nodes: 2
+  tensor_parallel: 2
+  weights_gib: 29           # du -h on head (docs/design/08; GiB)
+  max_model_len: 262144
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+  kv_utilization: 0.9
+
+env:
+  NCCL_DEBUG: WARN
+
+command: |
+  python -m serving.main {recipe} \
+    --nodes {nodes} --mode {mode} \
+    --host {host} --port {port} \
+    --max-new {max_new}

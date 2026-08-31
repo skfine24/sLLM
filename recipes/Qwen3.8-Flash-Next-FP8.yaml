@@ -1,0 +1,177 @@
+# Qwen/Qwen3.8-Flash-Next-FP8 recipe (arch qwen4_exp).
+#
+# A recipe = MODEL info only: identity, quant format, execution geometry, TP,
+# audited spec knobs, and the weights location (paths.local_dir). Cluster /
+# node / toolchain settings live in repo-root config.env, never here.
+#
+# CPU oracle + engine integration: docs/design/09 + log.md (A1-A7). PLE/ngram
+# and the GPU kernels are still gated (Q3-B / C milestones).
+# Facts from docs/design/06-audit-qwen4-exp.md.
+
+recipe_version: "1"
+name: Qwen3.8-Flash-Next-FP8
+description: sLLM native serving of Qwen/Qwen3.8-Flash-Next-FP8 (fp8 e4m3, QSA + hyper-connection + MoE) on the DGX Spark pair
+
+model_id: Qwen/Qwen3.8-Flash-Next-FP8
+arch: qwen4_exp
+status: skeleton
+dtype: bfloat16
+
+quant:
+  method: fp8
+  fmt: e4m3
+  activation: dynamic
+  weight_block_size: [128, 128]
+  scale_tensor_suffix: weight_scale_inv
+  modules_not_quantize: [lm_head, model.language_model.embed_tokens]
+
+text:
+  hidden_size: 2560
+  num_layers: 48
+  # explicit: 12 x (3 linear_attention + qsa_attention)
+  layer_types:
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+    - linear_attention
+    - linear_attention
+    - linear_attention
+    - qsa_attention
+  linear_attention:
+    kernel: gated_delta_rule
+    num_key_heads: 16
+    key_head_dim: 128
+    num_value_heads: 48
+    value_head_dim: 128
+    conv_kernel_size: 4
+    state_dtype: float32
+    qk_l2norm: true
+  full_attention:
+    kernel: qsa_indexed
+    num_heads: 24
+    num_kv_heads: 2
+    head_dim: 256
+    output_gate: false
+    rope:
+      type: mrope
+      theta: 10000000
+      mrope_section: [11, 11, 10]
+      mrope_interleaved: true
+      partial_rotary_factor: 0.25
+  mlp:
+    type: moe
+    num_experts: 512
+    num_experts_per_tok: 10
+    shared_experts: 1
+    intermediate_size: 640
+    shared_expert_intermediate_size: 640
+    hidden_act: silu
+  vocab_size: 248320
+  max_position_embeddings: 262144
+  rms_norm_eps: 1e-6
+
+mtp:
+  enabled: true
+  layers: 1
+  attention_type: full
+  has_fc: true
+
+vision:
+  enabled: true
+  depth: 27
+  hidden_size: 1152
+  num_heads: 16
+  patch_size: 16
+  temporal_patch_size: 2
+  spatial_merge_size: 2
+  intermediate_size: 4304
+  num_position_embeddings: 2304
+  out_hidden_size: 2560
+
+tp:
+  size: 2
+
+# audited-but-not-yet-engine facts (meta passthrough)
+spec:
+  qsa:
+    indexer_n_heads: 4
+    indexer_kv_heads: 1
+    indexer_head_dim: 128
+    indexer_budget: 2048
+    indexer_compress_ratio: 4
+  hc: {hc_count: 4, hc_lowrank: 320, heads_per_ngram: 8}
+  hyper_connection: true
+  moe: {router_aux_loss_coef: 0.001}
+  ple: {layer_ids: [2], embed_dim: 2560, conv_kernel_size: 4}
+  ngram: {ngram_size: 3, ngram_vocab_size_base: 20000000, split_ngram_parts: 128}
+  mtp_hybrid: true
+
+paths:
+  local_dir: ~/models/Qwen3.8-Flash-Next-FP8
+
+# ---- launch (consumed by the `sllm` launcher; CLI flags win) ---------------
+container: sllm-node:latest
+
+defaults:
+  # NOTE: max_*/kv_utilization are planning values; engine admission
+  # wiring lands with the C-phase GPU executor.
+  host: 0.0.0.0
+  port: 8002
+  nodes: 2
+  tensor_parallel: 2
+  weights_gib: 173          # du -h on head (docs/design/08; GiB)
+  max_model_len: 262144
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  kv_utilization: 0.9
+
+env:
+  NCCL_SOCKET_IFNAME: ""    # pair NIC; fill per node via config.env override
+  NCCL_DEBUG: WARN
+
+command: |
+  python -m serving.main {recipe} \
+    --nodes {nodes} --mode {mode} \
+    --host {host} --port {port} \
+    --max-new {max_new}

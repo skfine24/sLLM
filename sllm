@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# sllm <recipe.yaml> [options] -- recipe-driven launcher (Docker-first).
+#
+# Build:  deploy/run.sh build      (image: sllm-node:latest; kernels build
+#                                   inside the image via kernels/cuda/build.sh)
+# Run:    sllm recipes/Qwen3.8-Flash-Next-FP8.yaml [--tp 1|2] [--mode plan|run|serve]
+#
+# Inputs: the RECIPE is the model (defaults/env/command/weights location);
+# config.env is common SLLM config (cluster IPs, fallback port, image).
+# Precedence: CLI > recipe defaults > config.env (same contract as
+# `python -m serving.main`, which this launcher drives inside the image).
+# --tp validates against tp.size: fewer nodes are accepted only when the
+# recipe's defaults.weights_gib proves the fit (checked in serving/main.py).
+# The recipe `command:` template is rendered, then --model-dir/--chat are
+# APPENDED (CLI wins over any template default); do not add {chat} to the
+# template itself.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/env_source.sh"          # sllm_load_env: env vars win over config.env
+sllm_load_env "$HERE/config.env"
+PYBIN="${PYTHON:-python3}"
+command -v "$PYBIN" >/dev/null || PYBIN=python
+"$PYBIN" -c "import yaml" 2>/dev/null || {
+  echo "sllm: needs python with PyYAML on the host (set PYTHON=/path/to/python)" >&2
+  exit 1; }
+
+usage() {
+  echo "usage: sllm <recipe.yaml> [--tp|--nodes 1|2] [--mode plan|run|serve]"
+  echo "          [--port P] [--host H] [--chat TEXT] [--max-new N]"
+  echo "          [--model-dir D] [--dry]"
+  exit 1
+}
+[[ $# -ge 1 ]] || usage
+REC_ARG="$1"; shift
+REC="$REC_ARG"
+[[ -f "$REC" ]] || REC="$HERE/recipes/$REC_ARG"
+[[ -f "$REC" ]] || { echo "sllm: recipe not found: $REC_ARG"; exit 1; }
+REC="$("$PYBIN" -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "$REC")"
+REC_MOUNT=()
+case "$REC" in
+  "$HERE/"*) REC_REL="${REC#$HERE/}";;
+  *)  # recipe outside the repo: mount it into the image path
+     REC_REL="recipes/$(basename "$REC")"
+     REC_MOUNT=(-v "$REC:/sllm/$REC_REL:ro");;
+esac
+
+# recipe launch fields -> shell vars (container / defaults / weights dir)
+eval "$("$PYBIN" - "$REC" <<'PY'
+import shlex, sys, yaml
+d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+de = d.get("defaults") or {}
+tp = ((d.get("tp") or {}).get("size")) or 1
+q = lambda v, dflt="": shlex.quote(str(v)) if v not in (None, "") else dflt
+print(f"R_CONTAINER={q(d.get('container'), 'sllm-node:latest')}")
+print(f"R_HOST={q(de.get('host'), '0.0.0.0')}")
+print(f"R_PORT={q(de.get('port'))}")
+print(f"R_NODES={q(de.get('nodes'), tp)}")
+print(f"R_MAXNEW={q(de.get('max_new'), 32)}")
+print(f"R_MDIR={q((d.get('paths') or {}).get('local_dir', ''))}")
+PY
+)"
+NODES=""; PORT=""; HOST=""; MODE=""; CHAT=""; MAXNEW=""; MDIR=""; DRY=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tp|--nodes) NODES="$2"; shift 2;; --port) PORT="$2"; shift 2;;
+    --host) HOST="$2"; shift 2;;  --mode) MODE="$2"; shift 2;;
+    --chat) CHAT="$2"; shift 2;;  --max-new) MAXNEW="$2"; shift 2;;
+    --model-dir) MDIR="$2"; shift 2;; --dry) DRY=1; shift;;
+    *) usage;;
+  esac
+done
+# precedence: CLI > recipe defaults > config.env > built-in
+NODES="${NODES:-$R_NODES}"
+PORT="${PORT:-${R_PORT:-${SLLM_PORT:-8002}}}"
+HOST="${HOST:-$R_HOST}"
+MODE="${MODE:-plan}"
+MAXNEW="${MAXNEW:-$R_MAXNEW}"
+IMG="${SLLM_IMAGE:-$R_CONTAINER}"
+[[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || {
+  echo "sllm: --port must be a TCP port 1-65535 (got: $PORT)" >&2; exit 1; }
+
+TTY=()
+if [[ -t 0 && -t 1 ]]; then TTY=(-i -t); fi   # non-TTY safe (CI, systemd)
+RUN=(docker run --rm "${TTY[@]}" --gpus all --ipc=host -p "$PORT:$PORT"
+     "${REC_MOUNT[@]}")
+# recipe env map (empty values skipped; SLLM_PAIR_IFACE fills the NIC in
+# the image entrypoint -- empty means "use the config.env default")
+while IFS= read -r line; do
+  [[ -n "$line" ]] && RUN+=(-e "$line")
+done < <("$PYBIN" -c "import sys,yaml
+d=yaml.safe_load(open(sys.argv[1],encoding='utf-8')) or {}
+[print(f'{k}={v}') for k,v in (d.get('env') or {}).items() if str(v)]" "$REC")
+# weights directory (recipe paths.local_dir): mounted at the SAME path, and
+# always passed as --model-dir so the container never expands a stray ~
+MDIR="${MDIR:-$R_MDIR}"
+EXTRA_ARR=()
+if [[ -n "$MDIR" ]]; then
+  MDIR="${MDIR/#\~/$HOME}"
+  [[ -d "$MDIR" ]] || echo "sllm: weights dir missing on this node: $MDIR" >&2
+  RUN+=(-v "$MDIR:$MDIR:ro")
+  EXTRA_ARR+=(--model-dir "$MDIR")
+fi
+[[ -n "$CHAT" ]] && EXTRA_ARR+=(--chat "$CHAT")
+
+# command: recipe template (rendered) > default serving.main entry
+HAS_CMD="$("$PYBIN" -c "import sys,yaml;print((yaml.safe_load(open(sys.argv[1],encoding='utf-8')) or {}).get('command') or '')" "$REC")"
+if [[ -n "$HAS_CMD" ]]; then
+  CMD="$("$PYBIN" - "$REC" "$REC_REL" "$NODES" "$PORT" "$HOST" "$MODE" "$MAXNEW" "$MDIR" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+vals = dict(d.get("defaults") or {})
+vals.update(recipe="/sllm/" + sys.argv[2], nodes=sys.argv[3], port=sys.argv[4],
+            host=sys.argv[5], mode=sys.argv[6], max_new=sys.argv[7],
+            model_dir=sys.argv[8])
+print((d.get("command") or "").format(**vals).strip())
+PY
+)"
+  # append only flags the template does not already emit (CLI still wins:
+  # --model-dir/--chat are never in the shipped templates)
+  APPEND=("${EXTRA_ARR[@]}")
+  [[ "$CMD" == *"--max-new"* ]] || APPEND+=(--max-new "$MAXNEW")
+  EXTRA_STR="$(printf ' %q' "${APPEND[@]}")"
+  RUN+=("$IMG" bash -lc "cd /sllm && $CMD$EXTRA_STR")
+else
+  RUN+=("$IMG" python -m serving.main "/sllm/$REC_REL" --tp "$NODES"
+        --mode "$MODE" --host "$HOST" --port "$PORT" --max-new "$MAXNEW"
+        "${EXTRA_ARR[@]}")
+fi
+
+if [[ "$DRY" == 1 ]]; then
+  printf '%q ' "${RUN[@]}"; echo; exit 0
+fi
+exec "${RUN[@]}"

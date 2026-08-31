@@ -1,0 +1,12 @@
+# Build context is the repo root (docker build -f deploy/Dockerfile .).
+# Keep the image clean: caches, host-built kernel artifacts, VCS, vendored
+# upstream reference code (not needed at runtime).
+.git
+**/__pycache__/
+**/*.py[cod]
+kernels/cuda/*.o
+kernels/cuda/*.so
+kernels/cuda/*.cubin
+oracle/upstream/
+*.npz
+*.log

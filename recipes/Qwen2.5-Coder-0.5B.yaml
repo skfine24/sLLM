@@ -1,0 +1,106 @@
+# Qwen/Qwen2.5-Coder-0.5B recipe (arch qwen2, standard dense transformer).
+#
+# Audited from config.json: 24 layers, hidden 896, 14 heads / 2 KV (GQA),
+# head_dim 64, full-dim RoPE (theta 1e6), plain RMSNorm, dense SwiGLU MLP,
+# tied embeddings, BF16 (no FP8). Weight prefix "model" (Qwen2ForCausalLM).
+
+recipe_version: "1"
+name: Qwen2.5-Coder-0.5B
+description: single-node standard dense baseline (Qwen/Qwen2.5-Coder-0.5B, bf16) used for the P0 deploy checks
+
+model_id: Qwen/Qwen2.5-Coder-0.5B
+arch: qwen2
+status: ready
+dtype: bfloat16
+
+text:
+  prefix: model
+  tie_word_embeddings: true
+  hidden_size: 896
+  num_layers: 24
+  layer_types:
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  - full_attention
+  full_attention:
+    kernel: standard_gqa
+    num_heads: 14
+    num_kv_heads: 2
+    head_dim: 64
+    output_gate: false
+    rope:
+      type: default
+      theta: 1000000.0
+      mrope_section: [11, 11, 10]
+      mrope_interleaved: true
+      partial_rotary_factor: 1.0
+  mlp:
+    type: dense
+    intermediate_size: 4864
+    hidden_act: silu
+  vocab_size: 151936
+  max_position_embeddings: 32768
+  rms_norm_eps: 1e-6
+
+mtp:
+  enabled: false
+
+vision:
+  enabled: false
+
+tp:
+  # single node: the standard engine is single-device (serve_standard.py) and
+  # 0.5B bf16 fits one GB10 with >100 GB to spare (P0 ran exactly this way on
+  # head).
+  size: 1
+
+memory:
+  # KV placement mode (GPU-backed runs only; CPU path always uses host RAM).
+  #   device: conventional all-on-GPU KV (strict planned budget -> admission reject on overflow)
+  #   host:   KV/recurrent state in host RAM, gathered per decode step (recoverable OOM)
+  kv_placement: device
+
+paths:
+  local_dir: ~/models/Qwen2.5-Coder-0.5B
+
+# ---- launch (consumed by the `sllm` launcher; CLI flags win) ---------------
+container: sllm-node:latest
+
+defaults:
+  # NOTE: max_*/kv_utilization are planning values; engine admission
+  # wiring lands with the C-phase GPU executor.
+  host: 0.0.0.0
+  port: 8002
+  nodes: 1
+  tensor_parallel: 1
+  weights_gib: 0.95         # du -h on head (docs/design/08; GiB)
+  max_model_len: 32768
+  max_num_seqs: 8
+  kv_utilization: 0.9
+
+command: |
+  python -m serving.main {recipe} \
+    --nodes {nodes} --mode {mode} \
+    --host {host} --port {port} \
+    --max-new {max_new}
