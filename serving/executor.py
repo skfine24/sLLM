@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 
 import numpy as np
@@ -85,6 +86,12 @@ class ReferenceModel:
         self._resident_off = False
         self._gpu_warned = False
         self._gpu_last_err: Exception | None = None
+        # Guards the lazy construction of shared, expensive objects
+        # (device weight table, arch oracle, pipeline cfg). The HTTP serving
+        # path drives the model from a single executor thread, but the CLI and
+        # any direct concurrent caller must never double-build a GPU weight
+        # table (weights uploaded twice -> OOM) or observe a half-built oracle.
+        self._init_lock = threading.Lock()
 
     @property
     def _is_q4(self) -> bool:
@@ -99,17 +106,22 @@ class ReferenceModel:
         # prefill/decode state (state list + position), no shared buffers.
         m = getattr(self, "_dsv4_model", None)
         if m is None:
-            from ref.deepseek_v4 import DeepseekV4Cfg, DeepseekV4Model
-            cfg = self.dsv4_cfg or DeepseekV4Cfg.from_recipe(self.recipe)
-            kwargs = {"vision_cfg": self.vision_cfg} if self.vision_cfg else {}
-            self._dsv4_model = DeepseekV4Model(self.weights, cfg, self.recipe,
-                                               **kwargs)
-        return self._dsv4_model
+            with self._init_lock:
+                m = getattr(self, "_dsv4_model", None)
+                if m is None:
+                    from ref.deepseek_v4 import DeepseekV4Cfg, DeepseekV4Model
+                    cfg = self.dsv4_cfg or DeepseekV4Cfg.from_recipe(self.recipe)
+                    kwargs = {"vision_cfg": self.vision_cfg} if self.vision_cfg else {}
+                    m = DeepseekV4Model(self.weights, cfg, self.recipe, **kwargs)
+                    self._dsv4_model = m
+        return m
 
     def _q4cfg(self):
         if self.q4_cfg is None:
-            from ref.qwen4_exp_pipeline import Qwen4ExpCfg
-            self.q4_cfg = Qwen4ExpCfg.from_recipe(self.recipe)
+            with self._init_lock:
+                if self.q4_cfg is None:
+                    from ref.qwen4_exp_pipeline import Qwen4ExpCfg
+                    self.q4_cfg = Qwen4ExpCfg.from_recipe(self.recipe)
         return self.q4_cfg
 
     def _gpu_available(self) -> bool:
@@ -143,16 +155,19 @@ class ReferenceModel:
         if os.environ.get("SLLM_GPU_RESIDENT", "1") != "1":
             raise RuntimeError("disabled via SLLM_GPU_RESIDENT=0")
         if self._dev_table is None:
-            if is_hybrid:
-                from kernels.hybrid_device_decode import (
-                    HybridDeviceDecodeState, HybridDeviceWeightTable)
-                self._dev_table = HybridDeviceWeightTable(
-                    self.weights, self.recipe, dtype=self.gpu_dtype)
-            else:
-                self._dev_table = DeviceWeightTable(self.weights, self.recipe,
-                                                    dtype=self.gpu_dtype)
-            diag.info("sllm", f"device-resident decode active "
-                              f"(dtype={self.gpu_dtype}, weights on GPU)")
+            with self._init_lock:
+                if self._dev_table is None:
+                    if is_hybrid:
+                        from kernels.hybrid_device_decode import (
+                            HybridDeviceDecodeState, HybridDeviceWeightTable)
+                        table = HybridDeviceWeightTable(
+                            self.weights, self.recipe, dtype=self.gpu_dtype)
+                    else:
+                        table = DeviceWeightTable(self.weights, self.recipe,
+                                                  dtype=self.gpu_dtype)
+                    self._dev_table = table
+                    diag.info("sllm", f"device-resident decode active "
+                                      f"(dtype={self.gpu_dtype}, weights on GPU)")
         state = getattr(cache, "_resident", None)
         if state is None or state.table is not self._dev_table:
             if state is not None:
@@ -702,14 +717,6 @@ class InferenceEngine:
             top_p=top_p, seed=seed,
             repetition_penalty=repetition_penalty)["text"]
 
-
-        d = self.chat_detail(
-            messages, add_generation_prompt=add_generation_prompt,
-            max_new=max_new, temperature=temperature, top_k=top_k, top_p=top_p,
-            seed=seed,
-            repetition_penalty=repetition_penalty)
-        return d["text"]
-
     def _dsv4_text_chat_detail(self, messages, max_new=16, temperature=0.0,
                                top_k=None, top_p=None, seed=None,
                                repetition_penalty=None):
@@ -876,10 +883,12 @@ class BatchedInferenceEngine:
 
     def submit(self, prompt: str, max_new: int, temperature: float = 0.0,
                top_k: int | None = None, top_p: float | None = None,
-               seed: int | None = None, repetition_penalty: float | None = None) -> int:
+               seed: int | None = None, repetition_penalty: float | None = None,
+               sink=None, prompt_ids=None) -> int:
         seq_id = self._next_seq
         self._next_seq += 1
-        prompt_ids = self.tokenizer.encode(prompt)
+        prompt_ids = (list(int(i) for i in prompt_ids) if prompt_ids is not None
+                      else self.tokenizer.encode(prompt))
         max_ctx = getattr(self.model, "max_context", None)
         if callable(max_ctx):
             max_ctx = max_ctx()
@@ -891,13 +900,23 @@ class BatchedInferenceEngine:
             "prompt": prompt_ids, "gen": [], "max_new": int(max_new),
             "temperature": temperature, "top_k": top_k, "top_p": top_p,
             "rng": np.random.default_rng(seed), "text": None,
-            "rep": repetition_penalty,
+            "rep": repetition_penalty, "sink": sink,
             "cache": None, "last_id": None, "prefill_L": None,
         }
         self._order.append(seq_id)
         self.sched.add(seq_id, prompt_len=len(prompt_ids), max_new=int(max_new),
                        use_state=self._use_state)
         return seq_id
+
+    def attach(self, seq_id: int, sink) -> None:
+        """Register a per-sequence output sink on an already-submitted request.
+
+        The sink is any object exposing ``on_token(tok_id)`` and
+        ``on_finish(reason)``; the scheduler thread calls them as it decodes.
+        ``run_all`` / ``generate_batch`` never attach a sink and are unaffected."""
+        info = self._seqs.get(seq_id)
+        if info is not None:
+            info["sink"] = sink
 
     def abort(self, seq_id: int) -> bool:
         """Cancel a submitted request (client disconnect)."""
@@ -913,6 +932,25 @@ class BatchedInferenceEngine:
         if info["text"] is None:
             info["text"] = self.tokenizer.decode(info["gen"])
         return info["text"]
+
+    def reap(self) -> list[int]:
+        """Drop finished SINK-bearing sequences (the serving path) so a
+        long-lived BatchedInferenceEngine does not leak _seqs/_order/sched.done
+        across thousands of requests. Requests without a sink (run_all /
+        generate_batch CLI path) are never reaped, so _seqs stays readable
+        after run_all exactly as before. Returns the reaped seq ids."""
+        done_ids = {r.seq_id for r in self.sched.done}
+        reaped = []
+        for sid in list(self._seqs):
+            info = self._seqs[sid]
+            if info.get("sink") is not None and sid in done_ids:
+                self._seqs.pop(sid, None)
+                reaped.append(sid)
+        if reaped:
+            rs = set(reaped)
+            self._order = [s for s in self._order if s in self._seqs]
+            self.sched.done = [r for r in self.sched.done if r.seq_id not in rs]
+        return reaped
 
     def results_in_order(self) -> list[str]:
         return [self.result_text(i) for i in self._order]
@@ -938,8 +976,22 @@ class BatchedInferenceEngine:
             top_p=info["top_p"], rng=info["rng"],
         )
 
+    def _emit_token(self, info: dict, tok: int) -> None:
+        sink = info.get("sink")
+        if sink is not None:
+            sink.on_token(tok)
+
+    def _emit_finish(self, info: dict, reason: str) -> None:
+        sink = info.get("sink")
+        if sink is not None:
+            sink.on_finish(reason)
+
     def step(self) -> dict:
-        """Run one scheduler step: schedule actions, execute decodes, advance."""
+        """Run one scheduler step: schedule actions, execute decodes, advance.
+
+        When a sequence has an attached sink, newly generated token ids are
+        published (``on_token``) as they are produced and the terminal reason
+        (``on_finish``: "stop" on EOS, "length" on max_new) once it completes."""
         sched = self.sched.step()
         for a in sched.actions:
             info = self._seqs[a.seq_id]
@@ -962,6 +1014,13 @@ class BatchedInferenceEngine:
                     info["gen"].append(tok)
                     info["last_id"] = tok
                 self.sched.advance(a, eos=eos)
+                if info.get("sink") is not None:
+                    if not eos:
+                        self._emit_token(info, tok)
+                    if eos:
+                        self._emit_finish(info, "stop")
+                    elif len(info["gen"]) >= info["max_new"]:
+                        self._emit_finish(info, "length")
             else:
                 if self._inc and info["cache"] is None:
                     info["cache"], pl = self.model.prefill(info["prompt"])

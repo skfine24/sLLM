@@ -260,11 +260,13 @@ def run_model(recipe: Recipe, model_dir: str | None, chat: str | None,
 def serve_model(recipe: Recipe, model_dir: str | None, host: str,
                 port: str) -> int:
     engine = _build_engine(recipe, model_dir)
-    show = getattr(engine, "show_banner", None)
+    from serving.batched_server import wrap_for_serving
+    server_engine = wrap_for_serving(engine)
+    show = getattr(server_engine, "show_banner", None)
     if callable(show):
         show()
     from serving.server import create_server
-    server, bound = create_server(engine, host=host, port=int(port),
+    server, bound = create_server(server_engine, host=host, port=int(port),
                                   quiet=False,
                                   model_name=recipe.name or recipe.model_id)
     diag.info("sllm", f"{recipe.name or recipe.model_id}: OpenAI-compatible "
@@ -274,6 +276,9 @@ def serve_model(recipe: Recipe, model_dir: str | None, host: str,
         server.serve_forever()
     except KeyboardInterrupt:
         server.shutdown()
+    stop = getattr(server_engine, "stop", None)
+    if callable(stop):
+        stop()
     return 0
 
 

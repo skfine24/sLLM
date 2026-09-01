@@ -36,6 +36,22 @@ def _error(status: int, message: str) -> dict:
 MAX_BODY_BYTES = 32 << 20  # 32 MiB
 
 
+class InvalidRequestError(ValueError):
+    """Client-side problem (bad params, prompt too long, cannot ever fit the
+    KV budget) -> HTTP 400. Subclasses ValueError so the plain model paths
+    (which raise ValueError) keep mapping to 400 unchanged."""
+
+
+class SaturatedError(RuntimeError):
+    """Server is at capacity; the request could run once others finish.
+    -> HTTP 429 with a Retry-After hint. Raised by the batched serving
+    facade's admission control (never by the single-shot engine)."""
+
+    def __init__(self, message: str = "server at capacity", retry_after: int = 1):
+        super().__init__(message)
+        self.retry_after = int(retry_after)
+
+
 def _http_logged(method):
     """Wrap a handler method: time it and emit one INFO http line (quiet
     servers stay silent; used by do_GET / do_POST)."""
@@ -75,33 +91,69 @@ def make_handler(engine: InferenceEngine):
                 return
             super().log_message(fmt, *args)
 
-        def _send_json(self, status: int, obj: dict):
+        def _send_json(self, status: int, obj: dict, close: bool = False):
             self._status = status
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            if close:
+                # we did not consume the request body (413 / bad length):
+                # keep-alive would desync the next request on this socket,
+                # so announce the close and drop the connection after the resp
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_saturated(self, exc):
+            """429 + Retry-After (admission control said 'not now')."""
+            self._status = 429
+            body = json.dumps(_error(429, str(exc)), ensure_ascii=False).encode("utf-8")
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Retry-After", str(getattr(exc, "retry_after", 1)))
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
         def _send_sse(self, events):
             """Write OpenAI-style SSE frames for an iterable of event dicts
-            (Connection: close, so no chunked framing is needed on 1.1)."""
+            (Connection: close, so no chunked framing is needed on 1.1). An
+            engine failure AFTER the headers are committed cannot change the
+            status line, so it is reported as an in-band error frame followed
+            by [DONE] instead of propagating to do_POST (which would try to
+            send a JSON status on an already-started 200 body)."""
             self._status = 200
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
+            self.close_connection = True
             try:
                 for obj in events:
                     payload = json.dumps(obj, ensure_ascii=False)
                     self.wfile.write(("data: %s\n\n" % payload).encode("utf-8"))
                     self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return  # client went away; nothing left to write
+            except Exception as exc:  # noqa: BLE001 - headers already sent
+                diag.error("http", f"stream aborted: {type(exc).__name__}: {exc}")
+                try:
+                    err = {"error": {"message": f"stream error: {exc}",
+                                     "type": "server_error", "code": 500}}
+                    self.wfile.write(
+                        ("data: %s\n\n" % json.dumps(err, ensure_ascii=False))
+                        .encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+            try:
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
-                pass  # client went away; the generator is done
+                pass
 
         def _stream_common(self, events, chat: bool, body):
             """Yield OpenAI SSE event dicts from a (delta, finish_reason)
@@ -167,18 +219,28 @@ def make_handler(engine: InferenceEngine):
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
-                self._send_json(400, _error(400, "invalid Content-Length"))
+                # body length unknown -> cannot keep-alive (leftover bytes
+                # would be parsed as the next request line)
+                self._send_json(400, _error(400, "invalid Content-Length"),
+                                close=True)
+                return
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                self._send_json(411, _error(411, "chunked Transfer-Encoding "
+                                                 "is not supported"), close=True)
                 return
             if length <= 0:
                 self._send_json(400, _error(400, "empty body"))
                 return
             if length > MAX_BODY_BYTES:
-                self._send_json(413, _error(413, f"body exceeds {MAX_BODY_BYTES} bytes"))
+                # do not read a hostile/oversized body; close so the unread
+                # bytes cannot poison a reused keep-alive connection
+                self._send_json(413, _error(413, f"body exceeds {MAX_BODY_BYTES} bytes"),
+                                close=True)
                 return
             try:
                 body = json.loads(self.rfile.read(length).decode("utf-8"))
                 if not isinstance(body, dict):
-                    raise ValueError("request body must be a JSON object")
+                    raise InvalidRequestError("request body must be a JSON object")
                 if body.get("stream"):
                     if self.path == "/v1/chat/completions":
                         events = self._chat_stream(body)
@@ -200,14 +262,22 @@ def make_handler(engine: InferenceEngine):
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self._send_json(400, _error(400, f"invalid JSON: {exc}"))
                 return
-            except (KeyError, ValueError, TypeError, RuntimeError) as exc:
-                # RuntimeError: tokenizer.apply_chat_template on dirs without
-                # a chat template (tokenizer.py).
+            except InvalidRequestError as exc:
+                self._send_json(400, _error(400, str(exc)))
+                return
+            except SaturatedError as exc:
+                self._send_saturated(exc)
+                return
+            except (KeyError, ValueError, TypeError) as exc:
+                # plain model-side validation (prompt exceeds max context,
+                # bad message shape) is still the caller's fault -> 400
                 self._send_json(400, _error(400, str(exc)))
                 return
             except Exception as exc:  # noqa: BLE001 - keep the server alive
-                # an engine/handler bug must 500, not drop the connection
-                # (and must not kill the keep-alive state machine silently)
+                # RuntimeError (GPU-only decode failure, a checkpoint without
+                # a chat template) and any engine/handler bug are SERVER-side:
+                # 500, never a silent 400 or a dropped keep-alive connection
+                diag.error("http", f"internal error: {type(exc).__name__}: {exc}")
                 self._send_json(500, {"error": {
                     "message": f"internal error: {exc}",
                     "type": "server_error", "code": 500}})
@@ -216,27 +286,37 @@ def make_handler(engine: InferenceEngine):
 
         def _common(self, body) -> dict:
             default_max = getattr(self.server, "default_max_new", 16)
-            max_tokens = int(body.get("max_tokens", body.get("max_new",
-                                                             default_max)))
+            try:
+                max_tokens = int(body.get("max_tokens", body.get("max_new",
+                                                                 default_max)))
+            except (TypeError, ValueError):
+                raise InvalidRequestError("max_tokens must be an integer") from None
             if max_tokens < 1:
-                raise ValueError("max_tokens must be >= 1")
-            temperature = float(body.get("temperature", 0.0))
+                raise InvalidRequestError("max_tokens must be >= 1")
+            try:
+                temperature = float(body.get("temperature", 0.0))
+            except (TypeError, ValueError):
+                raise InvalidRequestError("temperature must be a number") from None
             if temperature < 0:
-                raise ValueError("temperature must be >= 0")
+                raise InvalidRequestError("temperature must be >= 0")
             top_p = body.get("top_p")
             top_k = body.get("top_k")
             seed = body.get("seed")
-            return {
-                "max_new": max_tokens, "temperature": temperature,
-                "top_p": float(top_p) if top_p is not None else None,
-                "top_k": int(top_k) if top_k is not None else None,
-                "seed": int(seed) if seed is not None else None,
-            }
+            try:
+                return {
+                    "max_new": max_tokens, "temperature": temperature,
+                    "top_p": float(top_p) if top_p is not None else None,
+                    "top_k": int(top_k) if top_k is not None else None,
+                    "seed": int(seed) if seed is not None else None,
+                }
+            except (TypeError, ValueError):
+                raise InvalidRequestError(
+                    "top_p/top_k/seed must be numeric") from None
 
         def _chat_completion(self, body) -> dict:
             messages = body.get("messages")
             if not isinstance(messages, list) or not messages:
-                raise ValueError("messages must be a non-empty list")
+                raise InvalidRequestError("messages must be a non-empty list")
             params = self._common(body)
             # engine.chat_detail renders the template ONCE and reports the
             # real token ledger (no re-encode guessing, real finish_reason)
@@ -257,7 +337,7 @@ def make_handler(engine: InferenceEngine):
         def _chat_stream(self, body):
             messages = body.get("messages")
             if not isinstance(messages, list) or not messages:
-                raise ValueError("messages must be a non-empty list")
+                raise InvalidRequestError("messages must be a non-empty list")
             params = self._common(body)  # has max_new, temperature, ...
             return self.engine.stream_chat(
                 messages,
@@ -267,13 +347,13 @@ def make_handler(engine: InferenceEngine):
         def _completion_stream(self, body):
             prompt = body.get("prompt")
             if not isinstance(prompt, str):
-                raise ValueError("prompt must be a string")
+                raise InvalidRequestError("prompt must be a string")
             return self.engine.stream_complete(prompt, **self._common(body))
 
         def _completion(self, body) -> dict:
             prompt = body.get("prompt")
             if not isinstance(prompt, str):
-                raise ValueError("prompt must be a string")
+                raise InvalidRequestError("prompt must be a string")
             params = self._common(body)
             d = self.engine.complete_detail(prompt, **params)
             return {
