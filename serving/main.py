@@ -171,6 +171,24 @@ def _build_engine(recipe: Recipe, model_dir: str | None):
             "sllm: real qwen4_exp weights need the exclusive-GPU "
             "milestones (C phase: fp8 GEMM kernels + device-resident state). "
             "Use --mode plan, or a tiny/ recipe for the dev engine.")
+    if recipe.arch == "qwen3_5":
+        # Qwen3.8-27B-FP8 real engine: GDN linear-attn + paged full-attn via
+        # the numpy incremental path (paged_flash + gated_delta_rule are in
+        # ref/incremental.SUPPORTED_KERNELS). Weights are fp8 e4m3;
+        # load_recipe_weights dequants to fp32 (~2x the 29 GiB store), so the
+        # node needs the quiet window (stop the shared vLLM container).
+        md = os.path.expanduser(model_dir or recipe.local_dir or "")
+        if not md or not os.path.isdir(md):
+            raise SystemExit(f"sllm: weights not found: {md or '(no path)'}")
+        shards = [os.path.join(md, f) for f in sorted(os.listdir(md))
+                  if f.endswith(".safetensors")]
+        if not shards:
+            raise SystemExit(f"sllm: no *.safetensors in {md}")
+        from loaders.weights import load_recipe_weights
+        from serving.executor import InferenceEngine, ReferenceModel
+        from serving.tokenizer import Tokenizer
+        weights = load_recipe_weights(shards)
+        return InferenceEngine(ReferenceModel(recipe, weights), Tokenizer(md))
     if recipe.arch not in ("qwen2", "llama"):
         raise SystemExit(
             f"sllm: arch {recipe.arch!r} has no executable engine yet "
@@ -256,10 +274,16 @@ def main(argv=None) -> int:
     ap.add_argument("--log-level", default=None,
                     choices=("TRACE", "DEBUG", "INFO", "WARNING", "ERROR"),
                     help="diagnostic verbosity (default $SLLM_LOG_LEVEL/INFO)")
+    ap.add_argument("--cpu", action="store_true",
+                    help="force CPU (numpy) decode even when CUDA is present "
+                         "(same as SLLM_USE_GPU=0; default is AUTO: GPU if "
+                         "CUDA+.so, else CPU)")
     ap.add_argument("--version", "-V", action="store_true",
                     help="print the sLLM version and exit")
     args = ap.parse_args(argv)
     diag.set_level(args.log_level)
+    if args.cpu:
+        os.environ["SLLM_USE_GPU"] = "0"
     if args.version:
         from serving.version import version_string
         print(f"sllm {version_string()}")

@@ -43,12 +43,21 @@ class ReferenceModel:
         # q4_cfg, it falls back to DeepseekV4Cfg.from_recipe when not given.
         self.dsv4_cfg = dsv4_cfg
         self.vision_cfg = vision_cfg
-        # GPU decode toggle (per step): enables the fused kernel decode drivers
-        # for standard/hybrid when the built .so + a CUDA device are present.
-        # Default from env SLLM_USE_GPU=1; any runtime failure falls back to
-        # the numpy incremental path transparently.
-        self.use_gpu = bool(use_gpu if use_gpu is not None
-                            else os.environ.get("SLLM_USE_GPU", "0") == "1")
+        # GPU decode toggle. DEFAULT: auto -- GPU/CUDA when the installed
+        # environment has a CUDA device + a built sllm_gpu.so, CPU (numpy)
+        # otherwise; the decode loop also degrades to numpy on any runtime
+        # failure. Force CPU with SLLM_USE_GPU=0 (or --cpu); force GPU with
+        # SLLM_USE_GPU=1/on/force. Any force still falls back on failure.
+        gpu_env = (os.environ.get("SLLM_USE_GPU", "auto") or "auto").lower()
+        if use_gpu is not None:
+            self.use_gpu = bool(use_gpu)
+            self.gpu_mode = "off" if not self.use_gpu else "force"
+        elif gpu_env in ("0", "false", "off", "cpu", "none", "numpy"):
+            self.use_gpu = False
+            self.gpu_mode = "off"
+        else:
+            self.use_gpu = True
+            self.gpu_mode = "auto" if gpu_env in ("", "auto") else "force"
         # Device-resident decode dtype (weights/KV): fp32 | bf16
         # (env SLLM_GPU_DTYPE; fp32 default until wider validation).
         self.gpu_dtype = (gpu_dtype or os.environ.get("SLLM_GPU_DTYPE", "fp32")).lower()
@@ -90,9 +99,18 @@ class ReferenceModel:
         if self._gpu_ok is None:
             try:
                 from kernels import _sllm_cuda as ck
-                self._gpu_ok = ck.device_count() >= 1
+                n = ck.device_count()
+                self._gpu_ok = n >= 1
             except Exception:
                 self._gpu_ok = False
+                n = 0
+            if self.use_gpu:
+                if self._gpu_ok:
+                    diag.info("sllm", f"GPU decode enabled (CUDA devices "
+                                      f"visible: {n})")
+                else:
+                    diag.info("sllm", "GPU unavailable/.so missing -> CPU "
+                                      "(numpy) decode")
         return self._gpu_ok
 
     def _resident_step(self, cache, last_id: int):

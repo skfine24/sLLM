@@ -26,8 +26,12 @@ identity, geometry, weight location and launch settings.
 
 - **Local (dev machine, no GPU / no checkpoint):** tiny reference engines —
   `python -m serving.cli` and `python -m serving.server` (built-in weights).
-- **Real standard model:** `Qwen2.5-Coder-0.5B` (and other Llama/Qwen2-family
-  checkpoints) via `serving/serve_standard.py`.
+- **Real standard models:** Llama/Qwen2-family (e.g. `Qwen2.5-Coder-0.5B`) via
+  `serving/serve_standard.py`.
+- **Real qwen3_5 (Qwen3.8-27B-FP8):** the real-checkpoint engine branch is
+  wired (GDN linear-attn + paged full-attn, numpy incremental); needs a
+  **quiet GPU window** because `load_recipe_weights` de-quantizes fp8→fp32
+  (~58 GiB). Run with `--tp 1` on a single node.
 - **Real qwen4_exp / deepseek_v4 checkpoints:** cluster-gated (full fp8/fp4
   GPU + TP2 milestones). Use `--mode plan` to see the run plan without a GPU.
 
@@ -207,7 +211,14 @@ python -m serving.serve_standard --model-dir ~/models/Qwen2.5-Coder-0.5B \
 ```
 
 Options: `--host` / `--port` (`$SLLM_HOST` / `$SLLM_PORT` fallback),
-`--kv-placement device|host`, `--use-gpu`, `--gpu-dtype fp32|bf16`.
+`--kv-placement device|host`, `--gpu-dtype fp32|bf16`.
+
+**GPU policy (default = AUTO):** the engine uses GPU/CUDA decode whenever the
+installed environment has a CUDA device + a built `sllm_gpu.so`, and falls
+back to CPU (numpy) otherwise — the decision is printed at startup
+(`GPU decode enabled (CUDA devices visible: N)` / `GPU unavailable -> CPU`).
+Force CPU with `--cpu` (or `SLLM_USE_GPU=0`); force GPU with `--use-gpu`
+(or `SLLM_USE_GPU=1`). Any runtime failure also degrades to CPU transparently.
 
 ---
 

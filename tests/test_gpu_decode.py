@@ -24,6 +24,53 @@ SO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "kernels", "c
 need_gpu = os.path.isfile(SO)
 
 
+class TestGpuPolicyAuto(unittest.TestCase):
+    """GPU-by-default + auto CPU fallback + forced-CPU policy (runs
+    EVERYWHERE: no .so/CUDA needed). The default is AUTO: use_gpu=True, which
+    the decode loop resolves against _gpu_available() and falls back to numpy
+    when no CUDA/.so is present; SLLM_USE_GPU=0 forces CPU."""
+
+    def _model(self, env_val):
+        old = os.environ.get("SLLM_USE_GPU")
+        if env_val is None:
+            os.environ.pop("SLLM_USE_GPU", None)
+        else:
+            os.environ["SLLM_USE_GPU"] = env_val
+        try:
+            return ReferenceModel(tiny_standard_recipe(),
+                                  tiny_standard_weights(np.random.default_rng(3)))
+        finally:
+            if old is None:
+                os.environ.pop("SLLM_USE_GPU", None)
+            else:
+                os.environ["SLLM_USE_GPU"] = old
+
+    def test_auto_default_is_gpu_mode(self):
+        m = self._model(None)               # env unset -> AUTO
+        self.assertTrue(m.use_gpu)
+        self.assertEqual(m.gpu_mode, "auto")
+
+    def test_env_zero_forces_cpu(self):
+        m = self._model("0")
+        self.assertFalse(m.use_gpu)
+        self.assertEqual(m.gpu_mode, "off")
+
+    def test_env_one_forces_gpu(self):
+        m = self._model("1")
+        self.assertTrue(m.use_gpu)
+        self.assertEqual(m.gpu_mode, "force")
+
+    def test_auto_generation_equals_explicit_cpu(self):
+        # auto (use_gpu=True) either uses the GPU or falls back to numpy; the
+        # emitted sequence must be identical to a forced-CPU run either way.
+        ids = list(range(1, 9))
+        a = self._model(None)
+        b = self._model("0")
+        ga = generate(a, None, ids, max_new=6, temperature=0.0, seed=1)
+        gb = generate(b, None, ids, max_new=6, temperature=0.0, seed=1)
+        self.assertEqual(ga, gb)
+
+
 @unittest.skipUnless(need_gpu, "sllm_gpu.so not built (no GPU toolchain)")
 class TestGpuStandardDecode(unittest.TestCase):
     def setUp(self):

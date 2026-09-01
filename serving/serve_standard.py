@@ -51,14 +51,20 @@ def main(argv=None):
     ap.add_argument("--kv-placement", choices=["device", "host"], default=None,
                     help="override the recipe memory.kv_placement (device|host)")
     ap.add_argument("--use-gpu", action="store_true",
-                    help="enable the GPU decode kernels for decode steps")
+                    help="force the GPU decode kernels when available "
+                         "(default is AUTO: GPU if CUDA+.so, else CPU)")
+    ap.add_argument("--cpu", action="store_true",
+                    help="force CPU (numpy) decode even when CUDA is present "
+                         "(same as SLLM_USE_GPU=0)")
     ap.add_argument("--gpu-dtype", choices=["fp32", "bf16"], default=None,
                     help="device-resident decode dtype for weights/KV "
                          "(env SLLM_GPU_DTYPE; default fp32)")
     ap.add_argument("--serve", action="store_true", help="start HTTP server instead of one-shot")
     args = ap.parse_args(argv)
 
-    if args.use_gpu:
+    if args.cpu:
+        os.environ["SLLM_USE_GPU"] = "0"
+    elif args.use_gpu:
         os.environ["SLLM_USE_GPU"] = "1"
     if args.gpu_dtype:
         os.environ["SLLM_GPU_DTYPE"] = args.gpu_dtype

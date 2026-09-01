@@ -31,7 +31,7 @@ command -v "$PYBIN" >/dev/null || PYBIN=python
 usage() {
   echo "usage: sllm <recipe.yaml> [--tp|--nodes 1|2] [--mode plan|run|serve]"
   echo "          [--port P] [--host H] [--chat TEXT] [--max-new N]"
-  echo "          [--model-dir D] [--dry]"
+  echo "          [--model-dir D] [--cpu] [--dry]"
   exit 1
 }
 [[ $# -ge 1 ]] || usage
@@ -63,13 +63,14 @@ print(f"R_MAXNEW={q(de.get('max_new'), 32)}")
 print(f"R_MDIR={q((d.get('paths') or {}).get('local_dir', ''))}")
 PY
 )"
-NODES=""; PORT=""; HOST=""; MODE=""; CHAT=""; MAXNEW=""; MDIR=""; DRY=0
+NODES=""; PORT=""; HOST=""; MODE=""; CHAT=""; MAXNEW=""; MDIR=""; DRY=0; CPU=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tp|--nodes) NODES="$2"; shift 2;; --port) PORT="$2"; shift 2;;
     --host) HOST="$2"; shift 2;;  --mode) MODE="$2"; shift 2;;
     --chat) CHAT="$2"; shift 2;;  --max-new) MAXNEW="$2"; shift 2;;
-    --model-dir) MDIR="$2"; shift 2;; --dry) DRY=1; shift;;
+    --model-dir) MDIR="$2"; shift 2;; --cpu) CPU=1; shift;;
+    --dry) DRY=1; shift;;
     *) usage;;
   esac
 done
@@ -95,6 +96,13 @@ while IFS= read -r line; do
 done < <("$PYBIN" -c "import sys,yaml
 d=yaml.safe_load(open(sys.argv[1],encoding='utf-8')) or {}
 [print(f'{k}={v}') for k,v in (d.get('env') or {}).items() if str(v)]" "$REC")
+# GPU policy: --cpu forces CPU; otherwise host SLLM_USE_GPU (auto default)
+# is forwarded so the container makes the GPU-vs-CPU decision itself
+if [[ "$CPU" == 1 ]]; then
+  RUN+=(-e "SLLM_USE_GPU=0")
+elif [[ -n "${SLLM_USE_GPU:-}" ]]; then
+  RUN+=(-e "SLLM_USE_GPU=$SLLM_USE_GPU")
+fi
 # weights directory (recipe paths.local_dir): mounted at the SAME path, and
 # always passed as --model-dir so the container never expands a stray ~
 MDIR="${MDIR:-$R_MDIR}"

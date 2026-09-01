@@ -36,7 +36,7 @@ def _weights_footprint(weights) -> tuple[int, int]:
 
 
 def _backend(model) -> str:
-    """Best-effort runtime backend label (guarded; numpy default)."""
+    """Best-effort runtime backend label (auto-detected; numpy default)."""
     arch = getattr(model, "recipe", None)
     arch = getattr(arch, "arch", None)
     isq = getattr(model, "_is_q4", False)
@@ -45,11 +45,19 @@ def _backend(model) -> str:
         return "numpy (oracle + device-resident state)"
     if isq:
         return "numpy (CPU pipeline; GPU kernels are milestone Q4-GPU)"
+    mode = getattr(model, "gpu_mode", "auto")
     if getattr(model, "use_gpu", False):
-        if getattr(model, "_resident_off", True) is False:
-            return f"gpu (device-resident {getattr(model, 'gpu_dtype', 'fp32')})"
-        if getattr(model, "_gpu_ok", None) is True:
+        if getattr(model, "_gpu_available", lambda: False)():
+            # resident table is built lazily on the first device-resident step
+            if (getattr(model, "_dev_table", None) is not None
+                    and getattr(model, "_resident_off", True) is False):
+                return f"gpu (device-resident {getattr(model, 'gpu_dtype', 'fp32')})"
             return "gpu (per-step kernel transfer)"
+        if mode == "off":
+            return "numpy (CPU forced)"
+        return "numpy (CPU; GPU unavailable, auto fallback)"
+    if mode == "off":
+        return "numpy (CPU forced)"
     return "numpy (recompute/incremental)"
 
 
