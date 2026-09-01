@@ -23,27 +23,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* host-side error buffer (same pattern as kernels.cu's g_last_error:
+   the extern "C" getter returns it; no device symbol needed). */
+static char g_ds_err[512] = {0};
+
+static void ds_set_err(const char *m) {
+  snprintf(g_ds_err, sizeof(g_ds_err), "%s", m);
+}
+
 #define CHECK(e)                                                     \
   do {                                                               \
     cudaError_t _e = (e);                                           \
     if (_e != cudaSuccess) {                                        \
-      snprintf(g_err, sizeof(g_err), "%s:%d %s", __FILE__, __LINE__, \
-               cudaGetErrorString(_e));                             \
+      snprintf(g_ds_err, sizeof(g_ds_err), "%s:%d %s", __FILE__,    \
+               __LINE__, cudaGetErrorString(_e));                   \
       return -1;                                                    \
     }                                                               \
   } while (0)
 
-__device__ char g_err_d[512];
-
-extern "C" const char *sllm_ds_last_error(void) {
-  static char host[512] = "no error";
-  cudaMemcpyFromSymbol(host, g_err_d, 512, 0, cudaMemcpyDeviceToHost);
-  return host;
-}
-
-__device__ void ds_err(const char *m) {
-  snprintf(g_err_d, sizeof(g_err_d), "%s", m);
-}
+extern "C" const char *sllm_ds_last_error(void) { return g_ds_err; }
 
 __global__ void ds_fp4_gemm_kernel(const float *__restrict__ a,
                                    const float *__restrict__ b,
@@ -59,7 +57,7 @@ __global__ void ds_fp4_gemm_kernel(const float *__restrict__ a,
 extern "C" int sllm_ds_fp4_gemm(float *o, const float *a, const float *b,
                                 int M, int N, int K, float scale, float *opts) {
   (void)scale; (void)opts;
-  if (M <= 0 || N <= 0 || K <= 0) { ds_err("bad dims"); return -1; }
+  if (M <= 0 || N <= 0 || K <= 0) { ds_set_err("bad dims"); return -1; }
   float *da, *db, *do_;
   CHECK(cudaMalloc(&da, (size_t)M * K * sizeof(float)));
   CHECK(cudaMalloc(&db, (size_t)N * K * sizeof(float)));
@@ -119,24 +117,29 @@ extern "C" int sllm_ds_mla_sparse_attn(float *o, const float *q,
                                        const float *sink, int S, int H, int D,
                                        int ntop, float scale, float *opts) {
   (void)opts;
-  if (S <= 0 || H <= 0 || D <= 0 || ntop <= 0) { ds_err("bad dims"); return -1; }
-  float *dq, *dr, *do_;
+  if (S <= 0 || H <= 0 || D <= 0 || ntop <= 0) {
+    ds_set_err("bad dims"); return -1;
+  }
+  float *dq, *dr, *do_, *dss;
   int *didx;
   CHECK(cudaMalloc(&dq, (size_t)S * H * D * sizeof(float)));
   CHECK(cudaMalloc(&dr, (size_t)(S * 4 + 1) * D * sizeof(float))); /* slack */
   CHECK(cudaMalloc(&do_, (size_t)S * H * D * sizeof(float)));
   CHECK(cudaMalloc(&didx, (size_t)S * ntop * sizeof(int)));
+  CHECK(cudaMalloc(&dss, (size_t)H * sizeof(float)));
   /* row count for r is supplied by callers as (S*4+1) cap; actual N is
      threaded through scale argument on the host wrapper in a later fused
      stage -- parity stub copies the full q/idx and relies on idx bounds. */
   CHECK(cudaMemcpy(dq, q, (size_t)S * H * D * sizeof(float), cudaMemcpyHostToDevice));
   CHECK(cudaMemcpy(dr, r, (size_t)(S * 4 + 1) * D * sizeof(float), cudaMemcpyHostToDevice));
   CHECK(cudaMemcpy(didx, idx, (size_t)S * ntop * sizeof(int), cudaMemcpyHostToDevice));
+  CHECK(cudaMemcpy(dss, sink, (size_t)H * sizeof(float), cudaMemcpyHostToDevice));
   dim3 grd(S, H);
-  ds_sparse_attn_kernel<<<grd, 1>>>(dq, dr, didx, sink, do_, S, H, D, ntop,
+  ds_sparse_attn_kernel<<<grd, 1>>>(dq, dr, didx, dss, do_, S, H, D, ntop,
                                     scale);
   CHECK(cudaGetLastError());
   CHECK(cudaMemcpy(o, do_, (size_t)S * H * D * sizeof(float), cudaMemcpyDeviceToHost));
-  CHECK(cudaFree(dq)); CHECK(cudaFree(dr)); CHECK(cudaFree(do_)); CHECK(cudaFree(didx));
+  CHECK(cudaFree(dq)); CHECK(cudaFree(dr)); CHECK(cudaFree(do_));
+  CHECK(cudaFree(didx)); CHECK(cudaFree(dss));
   return 0;
 }

@@ -50,7 +50,7 @@ def _setup():
         F, I = POINTER(c_float), c_int
         lib.sllm_ds_fp4_gemm.argtypes = [F, F, F, I, I, I, c_float, F]
         lib.sllm_ds_mla_sparse_attn.argtypes = [
-            F, F, F, POINTER(c_int), F, I, I, I, c_float, F]
+            F, F, F, POINTER(c_int), F, I, I, I, I, c_float, F]
         for n in _DS_ENTRIES:
             getattr(lib, n).restype = c_int
         _g = lib
