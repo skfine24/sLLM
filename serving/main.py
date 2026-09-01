@@ -151,6 +151,43 @@ def build_plan(recipe: Recipe, path: str, model_dir: str | None,
     return "\n".join(lines)
 
 
+def _ram_gib_available() -> float | None:
+    """Best-effort free host RAM in GiB (/proc/meminfo; None on non-Linux)."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) / (1024.0 ** 2)  # kB -> GiB
+    except Exception:  # noqa: BLE001 - guard is best-effort
+        return None
+    return None
+
+
+def _check_weight_mem(recipe: Recipe) -> None:
+    """Fast-fail BEFORE the fp8->fp32 dequant OOM-thrashes the node (the
+    loader now streams tensors one at a time, but a 27B still needs ~2x its
+    fp8 store in host RAM)."""
+    wg = float((recipe.defaults or {}).get("weights_gib") or 0)
+    if wg <= 0:
+        return
+    need = wg * 2.05 + 2.0                       # fp8->fp32 + loader/slack
+    avail = _ram_gib_available()
+    if avail is not None and need > avail:
+        raise SystemExit(
+            f"sllm: {recipe.model_id} needs ~{need:.0f} GiB host RAM for the "
+            f"fp32 reference load; ~{avail:.0f} GiB available. Stop the "
+            f"shared vLLM on ALL TP2 nodes for a quiet window, then retry "
+            f"(--mode plan never loads weights).")
+
+
+def _load_progress(path, done: int, total: int) -> None:
+    """Throttled loader progress (start/end + every 200th tensor) so a
+    multi-GiB build shows where it is instead of sitting silent."""
+    name = os.path.basename(path)
+    if done in (1, total) or done % 200 == 0:
+        diag.info("sllm", f"load {name}: {done}/{total} tensors")
+
+
 def _build_engine(recipe: Recipe, model_dir: str | None):
     """Engine for run/serve, or an honest SystemExit (never a silent
     fallback to a smaller model)."""
@@ -184,10 +221,15 @@ def _build_engine(recipe: Recipe, model_dir: str | None):
                   if f.endswith(".safetensors")]
         if not shards:
             raise SystemExit(f"sllm: no *.safetensors in {md}")
+        _check_weight_mem(recipe)
         from loaders.weights import load_recipe_weights
+        from serving import diag
         from serving.executor import InferenceEngine, ReferenceModel
         from serving.tokenizer import Tokenizer
-        weights = load_recipe_weights(shards)
+        weights = load_recipe_weights(shards, progress=_load_progress)
+        total_bytes = sum(int(np.asarray(v).nbytes) for v in weights.values())
+        diag.info("sllm", f"loaded {len(weights)} tensors "
+                          f"({diag.gib(total_bytes)} fp32)")
         return InferenceEngine(ReferenceModel(recipe, weights), Tokenizer(md))
     if recipe.arch not in ("qwen2", "llama"):
         raise SystemExit(
@@ -196,6 +238,7 @@ def _build_engine(recipe: Recipe, model_dir: str | None):
     md = os.path.expanduser(model_dir or recipe.local_dir or "")
     if not md or not os.path.isdir(md):
         raise SystemExit(f"sllm: weights not found: {md or '(no path)'}")
+    _check_weight_mem(recipe)
     from serving.serve_standard import load_standard_engine  # existing engine
     return load_standard_engine(md)[0]
 

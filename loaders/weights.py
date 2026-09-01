@@ -45,9 +45,64 @@ def load_recipe_weights(
     shard_paths: list[str],
     block_h: int = 128,
     block_w: int = 128,
+    scale_suffix: str = "_scale_inv",
+    progress=None,
 ) -> dict[str, object]:
-    """Load and dequantize all tensors from a list of shard paths."""
-    all_t = {}
+    """Load + DEQUANT-INLINE a set of shards into a flat fp32 dict.
+
+    Each tensor is dequantized as soon as it is read, so the peak host RAM is
+    ~the fp32 result alone (no full fp8 copy is held alongside it -- the
+    previous read-all-then-dequant path spiked ~2x and gave no output while a
+    multi-GiB 27B model loaded). Results are identical to
+    `load_tensors` + `dequant_tensors` (same flat names, scales dropped).
+
+    `progress(path, done, total)` is called periodically so a long build shows
+    where it is (the serving/main.py qwen3_5 path throttles it into INFO).
+    """
+    out: dict[str, object] = {}
     for path in shard_paths:
-        all_t.update(sr.load_tensors(path))
-    return dequant_tensors(all_t, block_h, block_w)
+        with open(path, "rb") as f:
+            header = sr.read_header(f)
+            names = list(header.tensors)
+            total = len(names)
+
+            # scale companion names (both suffix forms: appending _scale_inv
+            # or a leading-dot suffix that REPLACES .weight); these are never
+            # stored in the result.
+            scale_names = set()
+            for w in names:
+                if not w.endswith(".weight"):
+                    continue
+                sn = (w[: -len(".weight")] + scale_suffix
+                      if scale_suffix.startswith(".") else w + scale_suffix)
+                if sn in names:
+                    scale_names.add(sn)
+
+            def _read_raw(spec):
+                f.seek(header.data_offset + spec.begin)
+                span = spec.end - spec.begin
+                data = f.read(span)
+                if len(data) != span:
+                    raise sr.SafetensorsError(
+                        f"{spec.name!r}: truncated tensor data")
+                return data
+
+            store_names = [n for n in names if n not in scale_names]
+            total = len(store_names)
+            for i, name in enumerate(store_names):
+                spec = header.spec(name)
+                tensor = sr.decode_tensor_bytes(_read_raw(spec), spec)
+                if name.endswith(".weight"):
+                    scale_name = (name[: -len(".weight")] + scale_suffix
+                                  if scale_suffix.startswith(".")
+                                  else name + scale_suffix)
+                    if scale_name in header.tensors:
+                        scale = sr.decode_tensor_bytes(
+                            _read_raw(header.spec(scale_name)),
+                            header.spec(scale_name))
+                        tensor = dequant_weight_auto(tensor, scale,
+                                                     (block_h, block_w))
+                out[name] = tensor
+                if progress is not None:
+                    progress(path, i + 1, total)
+    return out
