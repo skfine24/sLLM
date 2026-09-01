@@ -84,6 +84,7 @@ class ReferenceModel:
         self._dev_table = None
         self._resident_off = False
         self._gpu_warned = False
+        self._gpu_last_err: Exception | None = None
 
     @property
     def _is_q4(self) -> bool:
@@ -217,9 +218,10 @@ class ReferenceModel:
     def decode_step(self, cache, last_id: int) -> np.ndarray:
         """Logits (V,) for the token after `last_id`, using only cached state.
 
-        With `use_gpu=True` and a working kernel build this runs on the GPU
-        (kernel drivers); any failure transparently falls back to the numpy
-        incremental path.
+        Placement=device in a CUDA environment is GPU-ONLY compute: resident ->
+        transfer kernels, and a real kernel failure surfaces as a RuntimeError
+        instead of silently dropping to the numpy incremental path. The host-
+        RAM path is the explicit `um` placement (or a machine without CUDA).
         """
         last_id = int(last_id)
         if self._is_q4:
@@ -247,15 +249,24 @@ class ReferenceModel:
                     return gpu_standard_decode_step(cache, self.weights, self.recipe, last_id)
                 from kernels.hybrid_decode import gpu_hybrid_decode_step
                 return gpu_hybrid_decode_step(cache, self.weights, self.recipe, last_id)
-            except Exception:  # pragma: no cover - degrade to numpy, never fail
+            except Exception as _e:  # noqa: BLE001 - remember; strict below
+                self._gpu_last_err = _e
                 if not self._gpu_warned:
                     import traceback
-                    import warnings
                     self._gpu_warned = True
-                    warnings.warn(
-                        "GPU decode step failed; falling back to the numpy "
-                        "path (for this step)\n" + traceback.format_exc(limit=4),
-                        RuntimeWarning, stacklevel=2)
+                    diag.warn("sllm", "GPU decode step failed"
+                                      f" ({type(_e).__name__}: {_e})")
+        if self._gpu_last_err is not None and self.placement == "device":
+            # CUDA env + device placement = GPU-ONLY compute. A real GPU-kernel
+            # failure is NOT silently hidden behind the numpy incremental path:
+            # surface it and let the operator pick the host-RAM mode instead.
+            diag.error("sllm", f"GPU decode failed ({type(self._gpu_last_err).__name__}: "
+                               f"{self._gpu_last_err}); placement=device is GPU-ONLY. "
+                               f"Re-run with --placement um for the host-RAM path, "
+                               f"or fix the kernel failure.")
+            raise RuntimeError(
+                "GPU decode failed (placement=device is GPU-only; re-run with "
+                "--placement um for the host-RAM path)") from self._gpu_last_err
         return _incremental.decode_step(cache, self.weights, self.recipe, last_id)
 
 

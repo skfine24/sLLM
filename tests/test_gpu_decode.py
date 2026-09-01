@@ -71,6 +71,35 @@ class TestGpuPolicyAuto(unittest.TestCase):
         self.assertFalse(m.use_gpu)
         self.assertEqual(m.gpu_mode, "off")
 
+    def test_device_placement_is_gpu_only_on_kernel_failure(self):
+        # CUDA env + placement device = GPU-ONLY: a kernel failure must raise
+        # (with the um hint), NOT silently fall back to the numpy decoder.
+        m = self._model(None)
+        m._gpu_ok = True
+        m._resident_off = True                # jump straight to transfer path
+        from kernels import standard_decode as sd
+        orig = sd.gpu_standard_decode_step
+
+        def _boom(*a, **k):
+            raise RuntimeError("kern-boom")
+        sd.gpu_standard_decode_step = _boom
+        try:
+            from ref import incremental as inc
+            st, _ = inc.prefill(list(range(1, 9)), m.weights, m.recipe)
+            with self.assertRaisesRegex(RuntimeError, "GPU-only"):
+                m.decode_step(st, 1)
+        finally:
+            sd.gpu_standard_decode_step = orig
+
+    def test_um_placement_keeps_host_ram_fallback(self):
+        m = self._model(None, "um")
+        m._gpu_ok = True
+        m._resident_off = True
+        from ref import incremental as inc
+        st, _ = inc.prefill(list(range(1, 9)), m.weights, m.recipe)
+        L = m.decode_step(st, 1)              # um -> straight numpy
+        self.assertTrue(np.isfinite(L).all())
+
     def test_auto_generation_equals_explicit_cpu(self):
         # auto (use_gpu=True) either uses the GPU or falls back to numpy; the
         # emitted sequence must be identical to a forced-CPU run either way.
