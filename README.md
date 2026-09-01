@@ -1,5 +1,9 @@
 # sLLM
 
+<p align="center">
+  <img src="sllm_logo.png" alt="sLLM logo" width="360"/>
+</p>
+
 sLLM은 듀얼노드 NVIDIA DGX Spark(GB10)를 위한 **자체 개발 모델 서빙 엔진**입니다.
 하나의 엔진으로 여러 모델을 하나씩 로드해 서빙하며, OpenAI 호환 HTTP API와 CLI를
 제공합니다.
