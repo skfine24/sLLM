@@ -135,22 +135,34 @@ class ReferenceModel:
         back). The host `cache` is only mutated at the END of a successful
         step, so a failed step leaves it exactly as the numpy path expects."""
         import warnings
-        from kernels.device_decode import DeviceDecodeState, DeviceWeightTable
+        from kernels.device_decode import (DeviceDecodeState, DeviceWeightTable)
 
-        if self.recipe.full_attention.kernel != "standard_gqa":
-            raise RuntimeError("resident decode is standard_gqa-only")
+        is_hybrid = self.recipe.arch == "qwen3_5"
+        if self.recipe.full_attention.kernel != "standard_gqa" and not is_hybrid:
+            raise RuntimeError("resident decode is standard_gqa / qwen3_5-only")
         if os.environ.get("SLLM_GPU_RESIDENT", "1") != "1":
             raise RuntimeError("disabled via SLLM_GPU_RESIDENT=0")
         if self._dev_table is None:
-            self._dev_table = DeviceWeightTable(self.weights, self.recipe,
-                                                dtype=self.gpu_dtype)
+            if is_hybrid:
+                from kernels.hybrid_device_decode import (
+                    HybridDeviceDecodeState, HybridDeviceWeightTable)
+                self._dev_table = HybridDeviceWeightTable(
+                    self.weights, self.recipe, dtype=self.gpu_dtype)
+            else:
+                self._dev_table = DeviceWeightTable(self.weights, self.recipe,
+                                                    dtype=self.gpu_dtype)
             diag.info("sllm", f"device-resident decode active "
                               f"(dtype={self.gpu_dtype}, weights on GPU)")
         state = getattr(cache, "_resident", None)
         if state is None or state.table is not self._dev_table:
             if state is not None:
                 state.free()
-            state = DeviceDecodeState(self._dev_table, cache, self.recipe)
+            if is_hybrid:
+                from kernels.hybrid_device_decode import HybridDeviceDecodeState
+                state = HybridDeviceDecodeState(self._dev_table, cache,
+                                                self.recipe)
+            else:
+                state = DeviceDecodeState(self._dev_table, cache, self.recipe)
             cache._resident = state
         try:
             return state.step(last_id)
@@ -232,8 +244,9 @@ class ReferenceModel:
             return self._dsv4model().decode_step(cache, last_id)
         if self.use_gpu and self._gpu_available():
             if (self.resident_preferred
-                    and self.recipe.full_attention.kernel == "standard_gqa"
-                    and not self._resident_off):
+                    and not self._resident_off
+                    and (self.recipe.full_attention.kernel == "standard_gqa"
+                         or self.recipe.arch == "qwen3_5")):
                 try:
                     return self._resident_step(cache, last_id)
                 except Exception as _e:  # noqa: BLE001 - degrade, never fail

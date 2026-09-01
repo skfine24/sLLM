@@ -140,6 +140,38 @@ class TestGpuStandardDecode(unittest.TestCase):
 
 
 @unittest.skipUnless(need_gpu, "sllm_gpu.so not built (no GPU toolchain)")
+class TestHybridDeviceResident(unittest.TestCase):
+    """qwen3_5 hybrid device-resident decode vs the numpy incremental oracle
+    (weights bf16 + full-attn KV on the GPU; GDN state host-mirrored)."""
+
+    def setUp(self):
+        from kernels import _sllm_cuda as ck
+        self.assertTrue(ck.device_count() >= 1)
+        self.recipe = tiny_recipe()
+        self.weights = tiny_weights(np.random.default_rng(5))
+        self.ids = list(range(1, 9))
+
+    def test_steps_match_numpy(self):
+        from kernels.hybrid_device_decode import (
+            HybridDeviceDecodeState, HybridDeviceWeightTable)
+        from ref import incremental as inc
+
+        cn, L0 = inc.prefill(self.ids, self.weights, self.recipe)
+        cg, _ = inc.prefill(self.ids, self.weights, self.recipe)
+        table = HybridDeviceWeightTable(self.weights, self.recipe, dtype="bf16")
+        st = HybridDeviceDecodeState(table, cg, self.recipe)
+        nxt = int(np.argmax(L0[0, -1]))
+        for _ in range(4):
+            L_np = inc.decode_step(cn, self.weights, self.recipe, nxt)
+            L_g = st.step(nxt)
+            self.assertEqual(int(np.argmax(L_g)), int(np.argmax(L_np)))
+            np.testing.assert_allclose(L_g, L_np, rtol=5e-3, atol=5e-3)
+            nxt = int(np.argmax(L_np))
+        st.free()
+        table.free()
+
+
+@unittest.skipUnless(need_gpu, "sllm_gpu.so not built (no GPU toolchain)")
 class TestGpuHybridWiring(unittest.TestCase):
     def setUp(self):
         from kernels import _sllm_cuda as ck
