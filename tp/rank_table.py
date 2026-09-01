@@ -64,7 +64,8 @@ class RankWeightTable:
         scales are sharded WITH the weight and dequant runs on the rank slice
         only (the full tensor is never materialized); replicated/owned-expert
         tensors are single tensors by definition, so the plain per-tensor
-        dequant already is the rank view."""
+        dequant already is the rank view. Scale format is auto-dispatched
+        (fp32 inverse for Qwen-style, E8M0/FP4 for DeepSeek-style)."""
         if not self.owns(name):
             raise RankOwnership(name)
         plan = self.sharding.plan_for(name)
@@ -76,6 +77,12 @@ class RankWeightTable:
         scale = self.table.scale(name)
         self.sharding.validate_tensor(name, fp8.shape, quantized=True)
         w_r, s_r = self.sharding.shard_pair(name, fp8, scale)[self.rank]
+        # deepseek stores E8M0 uint8 scales (or FP4 packed weights whose expert
+        # pairs are plan-whole); auto-dispatch avoids a silent fp32 misread.
+        if np.asarray(scale).dtype == np.uint8:
+            from loaders.fp8 import dequant_weight_auto
+            blk = getattr(self.sharding, "block", 128)
+            return dequant_weight_auto(w_r, s_r, block=(blk, blk))
         return dequant_weight_blocked(w_r, s_r)
 
     def close(self) -> None:

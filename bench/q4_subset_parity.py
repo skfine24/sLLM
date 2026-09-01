@@ -55,7 +55,9 @@ def load_recipe(tiny: bool):
 
 def pick_subset(cfg, layers):
     """Layer SUBSET (real indices). Default = first linear_attention + first
-    full_attention; PLE layers are excluded (not implemented; Q5)."""
+    full_attention; PLE layers are skipped by default so the subset/fixture
+    stays small (PLE itself is wired locally: ref/qwen4_exp_ple.py ->
+    pipeline `_ple_forward`, gated by cfg.ple_layer_ids)."""
     if layers:
         subset = list(layers)
     else:
@@ -104,7 +106,8 @@ def run_parity(model_dir: str, tiny: bool, layers, seq: int, seed: int,
     cfg = qp.Qwen4ExpCfg.from_recipe(load_recipe(tiny))
     subset, sub_cfg = pick_subset(cfg, layers)
     print(f"[q3] subset layers {subset} -> types {sub_cfg.layer_types} "
-          f"(PLE guard cleared for subset; PLE itself is unimplemented)")
+          f"(PLE skipped for the subset; PLE itself is wired: "
+          f"cfg.ple_layer_ids -> _ple_forward)")
 
     index = CheckpointIndex(model_dir)
     table = LazyWeightTable(index)

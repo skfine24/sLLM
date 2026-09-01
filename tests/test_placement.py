@@ -47,7 +47,12 @@ class TestKVMemoryPlan(unittest.TestCase):
     def test_bytes_per_token_geometry(self):
         recipe = tiny_standard_recipe()  # model.layers = 2 full attn, 2 KV heads, head_dim 4
         plan = KVMemoryPlan.from_recipe(recipe, block_size=8)
-        self.assertEqual(plan.bytes_per_token, 2 * 2 * 2 * 4 * 2)  # layers*2*kvh*hd*kv_bytes
+        # device backend stores fp32 buffers -> 4 B/element charged in the plan
+        self.assertEqual(plan.bytes_per_token, 2 * 2 * 2 * 4 * 4)
+        # host planning keeps the nominal BF16 (2 B) figure
+        recipe.memory.kv_placement = "host"
+        plan_h = KVMemoryPlan.from_recipe(recipe, block_size=8)
+        self.assertEqual(plan_h.bytes_per_token, 2 * 2 * 2 * 4 * 2)
 
 
 class TestHostKVBackend(unittest.TestCase):

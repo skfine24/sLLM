@@ -6,7 +6,11 @@
 # Run:    sllm recipes/Qwen3.8-Flash-Next-FP8.yaml [--tp 1|2] [--mode plan|run|serve]
 #
 # Inputs: the RECIPE is the model (defaults/env/command/weights location);
-# config.env is common SLLM config (cluster IPs, fallback port, image).
+# config.env is common SLLM config (cluster IPs, fallback host/port, image).
+# The HOST's live config.env is BIND-MOUNTED over the image copy (read-only)
+# so a node-side change applies without rebuilding the image; node-pair IPs
+# (SLLM_{HEAD,WORKER}_{,PAIR}_IP) and SLLM_PORT/SLLM_HOST are read from it by
+# serving.main / tp.topology inside the container.
 # Precedence: CLI > recipe defaults > config.env (same contract as
 # `python -m serving.main`, which this launcher drives inside the image).
 # --tp validates against tp.size: fewer nodes are accepted only when the
@@ -52,7 +56,7 @@ de = d.get("defaults") or {}
 tp = ((d.get("tp") or {}).get("size")) or 1
 q = lambda v, dflt="": shlex.quote(str(v)) if v not in (None, "") else dflt
 print(f"R_CONTAINER={q(d.get('container'), 'sllm-node:latest')}")
-print(f"R_HOST={q(de.get('host'), '0.0.0.0')}")
+print(f"R_HOST={q(de.get('host'))}")
 print(f"R_PORT={q(de.get('port'))}")
 print(f"R_NODES={q(de.get('nodes'), tp)}")
 print(f"R_MAXNEW={q(de.get('max_new'), 32)}")
@@ -72,7 +76,7 @@ done
 # precedence: CLI > recipe defaults > config.env > built-in
 NODES="${NODES:-$R_NODES}"
 PORT="${PORT:-${R_PORT:-${SLLM_PORT:-8002}}}"
-HOST="${HOST:-$R_HOST}"
+HOST="${HOST:-${R_HOST:-${SLLM_HOST:-0.0.0.0}}}"
 MODE="${MODE:-plan}"
 MAXNEW="${MAXNEW:-$R_MAXNEW}"
 IMG="${SLLM_IMAGE:-$R_CONTAINER}"
@@ -82,6 +86,7 @@ IMG="${SLLM_IMAGE:-$R_CONTAINER}"
 TTY=()
 if [[ -t 0 && -t 1 ]]; then TTY=(-i -t); fi   # non-TTY safe (CI, systemd)
 RUN=(docker run --rm "${TTY[@]}" --gpus all --ipc=host -p "$PORT:$PORT"
+     -v "$HERE/config.env:/sllm/config.env:ro"
      "${REC_MOUNT[@]}")
 # recipe env map (empty values skipped; SLLM_PAIR_IFACE fills the NIC in
 # the image entrypoint -- empty means "use the config.env default")

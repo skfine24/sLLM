@@ -116,6 +116,36 @@ class TestSpecDecode(unittest.TestCase):
         self.assertGreaterEqual(len(out), len(prompt))
         self.assertLessEqual(len(out), len(prompt) + 5)
 
+    def test_max_new_one_never_overshoots(self):
+        out = spec.spec_decode_greedy(self.model, self.weights, self.recipe,
+                                      [1, 2, 3], max_new=1, num_draft=2)
+        self.assertEqual(len(out), 4)  # exactly prompt + 1
+
+    def test_verify_is_aligned_adversarial(self):
+        # Main model: predicts 7 ONLY after a 7, else 9. Drafter: always 7.
+        # A misaligned verifier (checking draft[k] with the logits AFTER it)
+        # would accept the 7-chain; the aligned verifier must match greedy
+        # (9, 9, 9, ...).
+        import unittest.mock as mock
+
+        def fake_forward(arr, weights, recipe):
+            last = int(np.asarray(arr)[0, -1])
+            pred = 7 if last == 7 else 9
+            out = np.zeros((1, np.asarray(arr).shape[1], 10))
+            out[0, -1, pred] = 1.0
+            return out, None
+
+        with mock.patch.object(spec._pipeline, "model_forward",
+                               lambda *a, **k: fake_forward(*a, **k)[0]), \
+             mock.patch.object(spec._mtp, "mtp_next_token",
+                               lambda *a, **k: 7):
+            out = spec.spec_decode_greedy(None, {}, None, [1], max_new=1,
+                                          num_draft=2)
+            self.assertEqual(out, [1, 9])
+            out = spec.spec_decode_greedy(None, {}, None, [1], max_new=4,
+                                          num_draft=3)
+            self.assertEqual(out, [1, 9, 9, 9, 9])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

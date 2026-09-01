@@ -124,3 +124,115 @@ def write_q4_dev_fixture(d: str, cfg=None) -> dict:
         json.dump({"metadata": {"total_size": 1},
                    "weight_map": {k: "q4fix.safetensors" for k in w}}, f)
     return w
+
+
+def write_tiny_deepseek_checkpoint(d: str) -> dict:
+    """Single-shard DeepSeek-V4-style fixture: E4M3 + E8M0(ue8m0) scales for
+    attn/gate/shared-expert matrices, FP4-packed (E2M1) routed experts with
+    ue8m0 scales, BF16 embed/norm/head/vision/aligner. Returns the raw
+    storage arrays (same dtype as on "disk") for assertions."""
+    rng = np.random.default_rng(202)
+    H, NH, HD, KEXP = 256, 4, 512, 48
+    nexp = 2
+    store: dict[str, tuple[str, np.ndarray]] = {}
+
+    def bf16(name, shape):
+        if shape == ():
+            arr = rng.standard_normal(size=1)[0].astype(np.float32)
+        else:
+            arr = rng.standard_normal(size=shape).astype(np.float32)
+        store[name] = ("BF16", fp32_to_bf16_bits(arr))
+
+    def f32(name, shape):
+        store[name] = ("F32", rng.standard_normal(size=shape).astype(np.float32))
+
+    def fp8(name, shape):
+        a = rng.integers(0, 255, size=shape, dtype=np.uint8)
+        a[a == 127] = 126
+        bh, bw = (shape[0] + 127) // 128, (shape[1] + 127) // 128
+        s = rng.integers(1, 255, size=(bh, bw), dtype=np.uint8)
+        s[s == 255] = 254
+        store[name] = ("F8_E4M3", a)
+        store[name[: -len(".weight")] + ".scale"] = ("F8_E8M0", s)
+
+    def fp4exp(name, shape):
+        packed = rng.integers(0, 256, size=(shape[0], (shape[1] + 1) // 2),
+                              dtype=np.uint8)
+        s = rng.integers(1, 255, size=(shape[0], (shape[1] + 31) // 32),
+                         dtype=np.uint8)
+        s[s == 255] = 254
+        store[name] = ("U8", packed)
+        store[name[: -len(".weight")] + ".scale"] = ("F8_E8M0", s)
+
+    def fp4_group(name, shape):
+        packed = rng.integers(0, 256, size=(shape[0], (shape[1] + 1) // 2),
+                              dtype=np.uint8)
+        s = rng.integers(1, 255, size=(shape[0], (shape[1] + 31) // 32),
+                         dtype=np.uint8)
+        s[s == 255] = 254
+        store[name] = ("U8", packed)
+        store[name[: -len(".weight")] + ".scale"] = ("F8_E8M0", s)
+
+    bf16("embed.weight", (32, H))
+    bf16("head.weight", (32, H))
+    bf16("norm.weight", (H,))
+    f32("hc_head_scale", (1,))
+    f32("hc_head_base", (4,))
+    f32("hc_head_fn", (4, H * 4))
+    f32("attn_sink", (NH,))
+    f32("tid2eid", (32, 4))
+
+    # one MLA-ish block + one DSpark-ish block share the same tensor names
+    for lidx in (0, 1):
+        L = f"layers.{lidx}."
+        bf16(L + "attn_norm.weight", (H,))
+        fp8(L + "attn.wq_a.weight", (128, H))
+        bf16(L + "attn.q_norm.weight", (128,))
+        fp8(L + "attn.wq_b.weight", (NH * HD // 2, 128))
+        fp8(L + "attn.wkv.weight", (HD, H))
+        bf16(L + "attn.kv_norm.weight", (HD,))
+        bf16(L + "attn.wo_a.weight", (64, NH * HD // 8))
+        fp8(L + "attn.wo_b.weight", (H, 64))
+        fp8(L + "ffn.gate.weight", (16, H))
+        fp4_group(L + "ffn.shared_experts.w1.weight", (KEXP, H))
+        fp4_group(L + "ffn.shared_experts.w3.weight", (KEXP, H))
+        fp4_group(L + "ffn.shared_experts.w2.weight", (H, KEXP))
+        for e in range(nexp):
+            fp4exp(L + f"ffn.experts.{e}.w1.weight", (KEXP, H))
+            fp4exp(L + f"ffn.experts.{e}.w3.weight", (KEXP, H))
+            fp4exp(L + f"ffn.experts.{e}.w2.weight", (H, KEXP))
+        bf16(L + "ffn_norm.weight", (H,))
+        f32(L + "hc_attn_scale", (3,))
+        f32(L + "hc_ffn_scale", (3,))
+        f32(L + "hc_attn_base", (24,))
+        f32(L + "hc_ffn_base", (24,))
+        f32(L + "hc_attn_fn", (24, H * 4))
+        f32(L + "hc_ffn_fn", (24, H * 4))
+
+    # minimal vision tower (1 block) + aligner, all BF16
+    bf16("vision.patch_embed.proj.weight", (16, 588))
+    bf16("vision.patch_embed.proj.bias", (16,))
+    bf16("vision.blocks.0.norm1.weight", (16,))
+    bf16("vision.blocks.0.attn.wqkv.weight", (48, 16))
+    bf16("vision.blocks.0.attn.wqkv.bias", (48,))
+    bf16("vision.blocks.0.attn.wo.weight", (16, 16))
+    bf16("vision.blocks.0.attn.wo.bias", (16,))
+    bf16("vision.blocks.0.norm2.weight", (16,))
+    bf16("vision.blocks.0.mlp.w1.weight", (32, 16))
+    bf16("vision.blocks.0.mlp.w2.weight", (16, 32))
+    bf16("vision.norm.weight", (16,))
+    bf16("aligner.w1.weight", (16, 16 * 9))
+    bf16("aligner.w1.bias", (16,))
+    bf16("aligner.w2.weight", (16, 16))
+    bf16("aligner.w2.bias", (16,))
+    bf16("image_start", (H,))
+    bf16("image_pad", (H,))
+    bf16("image_end", (H,))
+    bf16("image_newline", (H,))
+
+    os.makedirs(d, exist_ok=True)
+    write_safetensors(os.path.join(d, "dsv4.safetensors"), store)
+    with open(os.path.join(d, "model.safetensors.index.json"), "w") as f:
+        json.dump({"metadata": {"total_size": 1},
+                   "weight_map": {k: "dsv4.safetensors" for k in store}}, f)
+    return {k: v for k, (_, v) in store.items()}

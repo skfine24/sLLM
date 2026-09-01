@@ -8,6 +8,7 @@ tensors addressed by these ids.
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass, field
 
 
@@ -23,15 +24,21 @@ class BlockTable:
     state_slot: int | None = None
 
     def length_tokens(self, block_size: int) -> int:
+        """Allocated CAPACITY in tokens (not the sequence's live length)."""
         return len(self.blocks) * block_size
 
 
 class KVBlockAllocator:
-    """Paged KV block allocator with per-sequence ownership tracking."""
+    """Paged KV block allocator with per-sequence ownership tracking.
+
+    Free ids live in a min-heap so allocation is O(count log F) and always
+    reuses the lowest free ids (no O(F log F) sort per call)."""
 
     def __init__(self, capacity: int):
         self.capacity = int(capacity)
-        self._free = set(range(self.capacity))
+        if self.capacity < 0:
+            raise ValueError("capacity must be >= 0")
+        self._free: list[int] = list(range(self.capacity))  # valid min-heap
         self._owner: dict[int, int] = {}  # block_id -> seq_id
 
     @property
@@ -47,18 +54,24 @@ class KVBlockAllocator:
             raise OutOfCapacity(
                 f"need {count} blocks, {len(self._free)} free (cap {self.capacity})"
             )
-        ids = sorted(self._free)[:count]
-        self._free.difference_update(ids)
+        ids = [heapq.heappop(self._free) for _ in range(count)]
         for b in ids:
             self._owner[b] = seq_id
         return ids
 
     def free(self, seq_id: int, ids: list[int]) -> None:
+        # validate EVERYTHING first, then mutate: a bad id must never leave
+        # the earlier ids of the batch already moved back to the free set.
+        seen: set[int] = set()
         for b in ids:
+            if b in seen:
+                raise ValueError(f"block {b} listed twice")
+            seen.add(b)
             if self._owner.get(b) != seq_id:
                 raise ValueError(f"block {b} not owned by {seq_id}")
+        for b in ids:
             del self._owner[b]
-            self._free.add(b)
+            heapq.heappush(self._free, b)
 
     def owned(self, seq_id: int) -> list[int]:
         return [b for b, s in self._owner.items() if s == seq_id]
@@ -70,7 +83,9 @@ class StateAllocator:
 
     def __init__(self, capacity: int):
         self.capacity = int(capacity)
-        self._free = set(range(self.capacity))
+        if self.capacity < 0:
+            raise ValueError("capacity must be >= 0")
+        self._free: list[int] = list(range(self.capacity))  # valid min-heap
         self._owner: dict[int, int] = {}
 
     @property
@@ -80,8 +95,7 @@ class StateAllocator:
     def allocate(self, seq_id: int) -> int:
         if not self._free:
             raise OutOfCapacity("no recurrent-state slots left")
-        slot = min(self._free)
-        self._free.discard(slot)
+        slot = heapq.heappop(self._free)
         self._owner[slot] = seq_id
         return slot
 
@@ -91,7 +105,7 @@ class StateAllocator:
         if self._owner.get(slot) != seq_id:
             raise ValueError(f"state slot {slot} not owned by {seq_id}")
         del self._owner[slot]
-        self._free.add(slot)
+        heapq.heappush(self._free, slot)
 
     def owned(self, seq_id: int) -> list[int]:
         return [s for s, o in self._owner.items() if o == seq_id]
@@ -120,10 +134,16 @@ class HybridKVCoordinator:
             raise ValueError(f"seq {seq_id} already registered")
         kv_blocks = self.blocks_for_tokens(tokens, block_size)
         table = BlockTable(seq_id=seq_id)
-        if kv_blocks:
-            table.blocks = self.kv.allocate(seq_id, kv_blocks)
-        if use_state:
-            table.state_slot = self.state.allocate(seq_id)
+        try:
+            if kv_blocks:
+                table.blocks = self.kv.allocate(seq_id, kv_blocks)
+            if use_state:
+                table.state_slot = self.state.allocate(seq_id)
+        except BaseException:
+            # a failed state-slot allocation must not strand the KV blocks
+            if table.blocks:
+                self.kv.free(seq_id, table.blocks)
+            raise
         self.tables[seq_id] = table
         return table
 
@@ -138,11 +158,14 @@ class HybridKVCoordinator:
             table.blocks.extend(self.kv.allocate(seq_id, want - have))
 
     def free_sequence(self, seq_id: int) -> None:
-        table = self.tables.pop(seq_id, None)
+        table = self.tables.get(seq_id)
         if table is None:
             return
+        # free the resources BEFORE dropping the metadata: an ownership
+        # error must not destroy the bookkeeping needed to recover.
         self.kv.free(seq_id, table.blocks)
         self.state.free(seq_id, table.state_slot)
+        self.tables.pop(seq_id, None)
 
     def kv_used(self, seq_id: int) -> int:
         return len(self.tables[seq_id].blocks)

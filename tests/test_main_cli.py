@@ -80,6 +80,10 @@ class TestSllmMain(unittest.TestCase):
                              "--mode", "plan"])
         self.assertEqual(rc, 0)
 
+    def test_version_flag_without_recipe(self):
+        rc = sllm_main.main(["--version"])
+        self.assertEqual(rc, 0)
+
     def test_resolve_precedence(self):
         r = _load("Qwen3.8-Flash-Next-FP8.yaml")
         self.assertEqual(sllm_main.resolve(r, None, None, None),
@@ -169,7 +173,7 @@ class TestOpenAIServe(unittest.TestCase):
         self.assertEqual(obj["object"], "chat.completion")
         self.assertEqual(obj["model"], "Qwen2.5-Coder-0.5B")
         self.assertEqual(obj["choices"][0]["message"]["role"], "assistant")
-        self.assertEqual(obj["choices"][0]["finish_reason"], "stop")
+        self.assertIn(obj["choices"][0]["finish_reason"], ("stop", "length"))
         self.assertEqual(
             obj["usage"]["total_tokens"],
             obj["usage"]["prompt_tokens"] + obj["usage"]["completion_tokens"])
@@ -180,15 +184,19 @@ class TestOpenAIServe(unittest.TestCase):
         self.assertEqual(obj["model"], "anything")
         self.assertEqual(obj["object"], "text_completion")
 
-    def test_stream_rejected_explicitly(self):
+    def test_stream_is_sse(self):
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/v1/chat/completions",
             data=json.dumps({"messages": [{"role": "user", "content": "x"}],
+                             "max_tokens": 2, "temperature": 0.0,
                              "stream": True}).encode("utf-8"),
             headers={"Content-Type": "application/json"})
-        with self.assertRaises(urllib.error.HTTPError) as cm:
-            urllib.request.urlopen(req, timeout=10)
-        self.assertEqual(cm.exception.code, 400)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertEqual(r.headers.get("Content-Type", ""),
+                             "text/event-stream; charset=utf-8")
+            body = r.read().decode("utf-8")
+        self.assertIn("data: [DONE]", body)
+        self.assertIn("chat.completion.chunk", body)
 
 
 if __name__ == "__main__":

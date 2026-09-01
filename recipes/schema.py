@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import Any
+import re
 
 
 class RecipeError(ValueError):
@@ -23,6 +24,11 @@ class RecipeError(ValueError):
 # (qsa_attention / mla_attention) are permitted for skeleton recipes whose
 # kernels are not implemented yet.
 KNOWN_LAYER_TYPES = ("linear_attention", "full_attention", "qsa_attention", "mla_attention")
+
+KNOWN_ARCHS = ("standard", "qwen2", "qwen3_5", "qwen4_exp", "deepseek_v4")
+KNOWN_DTYPES = ("bfloat16", "fp8", "float32", "float16")
+_MODEL_ID_RE = re.compile(r"^[\w./+-]+$")
+DEEPSEEK_COMPRESS_RATIOS = {0, 4, 128}
 
 
 def _require(d: dict, key: str, typename: str) -> Any:
@@ -179,7 +185,15 @@ class MTPSpec:
 
 @dataclass
 class VisionSpec:
+    """Vision config exposed on recipes.
+
+    qwen2vision uses the classic fields (depth, hidden_size, ...); DeepSeek-V4
+    uses the SigLIP-style tower fields (dim, n_layers, ...) with a 2D-RoPE
+    tower and an `aligner` 3x downsample. Unused fields default to None and
+    are filled from the model config at runtime.
+    """
     enabled: bool = False
+    # classic (qwen2) layout
     depth: int = 27
     hidden_size: int = 1152
     num_heads: int = 16
@@ -189,6 +203,17 @@ class VisionSpec:
     intermediate_size: int = 4304
     num_position_embeddings: int = 2304
     out_hidden_size: int = 5120
+    # deepseek V4 (SigLIP) layout
+    dim: int | None = None
+    n_layers: int | None = None
+    heads: int | None = None
+    inter_dim: int | None = None
+    ds_patch_size: int | None = None
+    downsample_ratio: int | None = None
+    max_n_token: int | None = None
+    min_pixels: int | None = None
+    max_wh_ratio: float | None = None
+    rope_theta: float | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "VisionSpec":
@@ -200,6 +225,13 @@ class VisionSpec:
                   "spatial_merge_size", "intermediate_size", "num_position_embeddings", "out_hidden_size"):
             if k in d:
                 setattr(s, k, _require(d, k, "int"))
+        for k in ("dim", "n_layers", "heads", "inter_dim", "ds_patch_size",
+                  "downsample_ratio", "max_n_token", "min_pixels"):
+            if k in d:
+                setattr(s, k, _require(d, k, "int"))
+        for k in ("max_wh_ratio", "rope_theta"):
+            if k in d:
+                setattr(s, k, _require(d, k, "float"))
         return s
 
 
@@ -309,6 +341,15 @@ class Recipe:
         model_id = _require(d, "model_id", "str")
         arch = _require(d, "arch", "str")
         dtype = d.get("dtype", "bfloat16")
+        if not model_id.strip():
+            raise RecipeError("model_id must be non-empty")
+        if not _MODEL_ID_RE.match(model_id):
+            raise RecipeError(
+                f"model_id {model_id!r}: only [A-Za-z0-9_./+-] allowed, no spaces")
+        if arch not in KNOWN_ARCHS:
+            raise RecipeError(f"unknown arch {arch!r} (known: {KNOWN_ARCHS})")
+        if dtype not in KNOWN_DTYPES:
+            raise RecipeError(f"unknown dtype {dtype!r} (known: {KNOWN_DTYPES})")
         quant = QuantSpec.from_dict(d.get("quant", {}))
         text = d.get("text", {})
         if not isinstance(text, dict):
@@ -329,6 +370,27 @@ class Recipe:
         for lt in layer_types:
             if lt not in known:
                 raise RecipeError(f"unknown layer_type {lt!r}")
+
+        spec = d.get("spec") or {}
+        if arch == "deepseek_v4":
+            cr = (spec.get("compress_ratios") or [])
+            if cr:
+                # compress_ratios is OPTIONAL (the cfg default tuple applies);
+                # when present it must be a full per-layer int list of allowed
+                # values so a typo (e.g. 13 instead of 128) is caught up front.
+                if not isinstance(cr, (list, tuple)) or any(
+                        not isinstance(x, int) for x in cr):
+                    raise RecipeError("deepseek_v4 spec.compress_ratios must "
+                                      "be a list of ints")
+                if len(cr) != num_layers:
+                    raise RecipeError(
+                        f"spec.compress_ratios length {len(cr)} != layers "
+                        f"{num_layers}")
+                bad = set(cr) - DEEPSEEK_COMPRESS_RATIOS
+                if bad:
+                    raise RecipeError(
+                        f"compress_ratios values {sorted(bad)} not in "
+                        f"{sorted(DEEPSEEK_COMPRESS_RATIOS)}")
 
         defaults = d.get("defaults", {})
         if not isinstance(defaults, dict):

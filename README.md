@@ -26,7 +26,7 @@ Target models (recipes):
 > sllm recipes/Qwen3.8-27B-FP8.yaml --tp 1 --mode plan  # TP mode option
 > ```
 >
-> `sllm <recipe> [--tp|--nodes 1|2] [--mode plan|run|serve] ...` —
+> `sllm <recipe> [--tp|--nodes 1|2] [--mode plan|run|serve] [--log-level L] ...` —
 > precedence CLI > recipe defaults > config.env. TP1/TP2 are first-class:
 > tp.mode defaults from the recipe, `--tp 1` is accepted only when
 > `defaults.weights_gib` provably fits one node (arithmetic, never silent).
@@ -34,6 +34,14 @@ Target models (recipes):
 > `POST /v1/chat/completions`, `POST /v1/completions`, usage counts;
 > `stream:true` explicitly rejected until SSE). Native equivalent:
 > `python -m serving.main <recipe>` (same entry the container runs).
+>
+> **Diagnostics (vLLM-style):** every engine prints a startup banner and
+> per-request stats (`prompt/out tokens`, wall time, `tokens/s`, finish
+> reason) as tag-prefixed INFO lines to **stderr** (`[sllm]`, `[gen]`,
+> `[http]`); per-token detail lives at DEBUG. Level = `--log-level
+> TRACE|DEBUG|INFO|WARNING|ERROR` or `SLLM_LOG_LEVEL` (default INFO); the
+> arch registry in `serving/engine_cards.py` is the extension point for new
+> model families.
 
 | Recipe | Model | Architecture | Weights |
 |---|---|---|---|

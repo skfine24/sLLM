@@ -40,6 +40,7 @@ from env_config import get_int as _env_int
 from recipes.schema import Recipe
 from runtime.memory_planner import (kv_bytes_per_token, qwen4_exp_bytes_per_token,
                                     qwen4_exp_seq_state_bytes)
+from serving import diag
 from tp.topology import ClusterTopology
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -87,6 +88,8 @@ def _check_nodes(recipe: Recipe, nodes: int) -> int:
                 f"{budget} GiB budget (use --tp {tp})")
         print(f"sllm: TP{nodes} override: {w} GiB weights fit one node "
               f"({per_node:.0f} GiB <= {budget} GiB budget)")
+    else:
+        diag.info("sllm", f"TP{nodes} (recipe tp.size={tp})")
     return nodes
 
 
@@ -115,13 +118,27 @@ def build_plan(recipe: Recipe, path: str, model_dir: str | None,
             for r in topo.ranks:
                 lines.append(f"  rank {r.rank}: host={r.host} pair={r.pair_ip} "
                              f"dev={r.device}")
-            from tp.topology import HEAD_PAIR_IP, WORKER_PAIR_IP
-            lines.append(f"  pair link: {HEAD_PAIR_IP} <-> {WORKER_PAIR_IP} "
-                         f"(bandwidth measured in milestone B via "
-                         f"bench/probe_pair_link.sh)")
+            lines.append(f"  pair link: {topo.ranks[0].pair_ip} <- -> "
+                         f"{topo.ranks[1].pair_ip} (bandwidth measured in "
+                         f"milestone B via bench/probe_pair_link.sh)")
         else:
             lines.append("  rank 0   : single node (TP1 override validated "
                          "against defaults.weights_gib)")
+    elif recipe.arch == "deepseek_v4":
+        from ref.deepseek_v4 import DeepseekV4Cfg
+        from runtime.memory_planner import (deepseek_bytes_per_token,
+                                            deepseek_seq_state_bytes)
+        cfg = DeepseekV4Cfg.from_recipe(recipe)
+        per_tok = deepseek_bytes_per_token(cfg, kv_bytes=1, idx_bytes=1)
+        per_seq = deepseek_seq_state_bytes(cfg)
+        lines.append(
+            f"  cache    : {per_tok} B/token (MLA window + compressed KV + "
+            f"indexer), {per_seq / 2**20:.0f} MiB/sequence compressor state "
+            f"(fp32)")
+        w = recipe.defaults.get("weights_gib")
+        if w is not None:
+            lines.append(f"  weights  : {w} GiB fp8/fp4 -> ~{float(w) / nodes:.0f} "
+                         f"GiB/rank at tp{nodes}")
     elif recipe.arch in ("qwen3_5", "qwen3_5_moe"):
         per_tok = kv_bytes_per_token(recipe, kv_bytes=1)
         lines.append(f"  cache    : {per_tok} B/token (fp8 KV over "
@@ -168,6 +185,9 @@ def _build_engine(recipe: Recipe, model_dir: str | None):
 def run_model(recipe: Recipe, model_dir: str | None, chat: str | None,
               max_new: int) -> int:
     eng = _build_engine(recipe, model_dir)
+    show = getattr(eng, "show_banner", None)
+    if callable(show):
+        show()
     out = eng.chat([{"role": "user", "content": chat or "hello"}],
                    max_new=max_new)
     print(out if isinstance(out, str) else str(out))
@@ -177,13 +197,16 @@ def run_model(recipe: Recipe, model_dir: str | None, chat: str | None,
 def serve_model(recipe: Recipe, model_dir: str | None, host: str,
                 port: str) -> int:
     engine = _build_engine(recipe, model_dir)
+    show = getattr(engine, "show_banner", None)
+    if callable(show):
+        show()
     from serving.server import create_server
     server, bound = create_server(engine, host=host, port=int(port),
                                   quiet=False,
                                   model_name=recipe.name or recipe.model_id)
-    print(f"[sllm] {recipe.name or recipe.model_id}: OpenAI-compatible API "
-          f"on http://{host}:{bound} "
-          f"(/v1/models, /v1/chat/completions, /v1/completions)")
+    diag.info("sllm", f"{recipe.name or recipe.model_id}: OpenAI-compatible "
+                      f"API on http://{host}:{bound} (/v1/models, "
+                      f"/v1/chat/completions, /v1/completions)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -193,9 +216,10 @@ def serve_model(recipe: Recipe, model_dir: str | None, host: str,
 
 def resolve(recipe: Recipe, nodes: int | None, host: str | None,
             port: str | None):
-    """Precedence: CLI > recipe `defaults:` > config.env (SLLM_PORT) >
-    built-in. host has no config.env layer (bind address is a CLI/recipe
-    concern)."""
+    """Precedence: CLI > recipe `defaults:` > config.env (SLLM_HOST /
+    SLLM_PORT) > built-in. The serve bind address is a recipe concern
+    (`defaults.host`/`defaults.port`); node-pair IPs live in config.env
+    (SLLM_{HEAD,WORKER}_{,PAIR_}IP, tp/topology.py)."""
     de = recipe.defaults
     try:
         n = nodes if nodes is not None else int(
@@ -203,7 +227,7 @@ def resolve(recipe: Recipe, nodes: int | None, host: str | None,
     except (TypeError, ValueError):
         raise SystemExit(f"sllm: defaults.nodes must be an integer "
                          f"(got {de.get('nodes')!r})") from None
-    h = host or de.get("host") or "0.0.0.0"
+    h = host or de.get("host") or _env("SLLM_HOST") or "0.0.0.0"
     p = port or str(de.get("port") or _env("SLLM_PORT", "8002"))
     try:
         if not 0 < int(p) < 65536:
@@ -216,7 +240,8 @@ def resolve(recipe: Recipe, nodes: int | None, host: str | None,
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="sllm", description=__doc__.splitlines()[0])
-    ap.add_argument("recipe", help="recipe yaml (path or name under recipes/)")
+    ap.add_argument("recipe", nargs="?",
+                    help="recipe yaml (path or name under recipes/)")
     ap.add_argument("--tp", "--nodes", dest="nodes", type=int, default=None,
                     metavar="N",
                     help="TP mode (1 or 2); default = recipe "
@@ -228,7 +253,19 @@ def main(argv=None) -> int:
     ap.add_argument("--port", default=None)
     ap.add_argument("--chat", default=None)
     ap.add_argument("--max-new", type=int, default=32)
+    ap.add_argument("--log-level", default=None,
+                    choices=("TRACE", "DEBUG", "INFO", "WARNING", "ERROR"),
+                    help="diagnostic verbosity (default $SLLM_LOG_LEVEL/INFO)")
+    ap.add_argument("--version", "-V", action="store_true",
+                    help="print the sLLM version and exit")
     args = ap.parse_args(argv)
+    diag.set_level(args.log_level)
+    if args.version:
+        from serving.version import version_string
+        print(f"sllm {version_string()}")
+        return 0
+    if args.recipe is None:
+        ap.error("the following arguments are required: recipe")
 
     recipe, path = _resolve(args.recipe)
     nodes, host, port = resolve(recipe, args.nodes, args.host, args.port)

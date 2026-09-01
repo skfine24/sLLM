@@ -189,6 +189,46 @@ class TestScheduler(unittest.TestCase):
         self.assertTrue(done)
         self.assertTrue(all(r.tokens_generated <= 1 for r in s.done))
 
+    def test_backfill_admission_skips_oversized_head(self):
+        # head request does not fit (worst 3 blocks > cap 2); the smaller one
+        # behind it must still be admitted (no head-of-line starvation).
+        s = Scheduler(kv_capacity=2, state_capacity=4, block_size=16,
+                      chunk_size=8, max_concurrency=4)
+        s.add(0, 40, 10)    # worst ceil(50/16)=4 -> never fits cap 2
+        s.add(1, 1, 1)      # worst 1 -> fits
+        self.assertEqual(s.pump(), [1])
+        self.assertEqual(s.waiting_count, 1)
+        self.assertEqual(s.running[0].seq_id, 1)
+
+    def test_add_rejects_duplicate_seq_id(self):
+        s = self.make()
+        s.add(7, 1, 1)
+        with self.assertRaises(ValueError):
+            s.add(7, 1, 1)
+
+    def test_abort_running_frees_resources(self):
+        s = self.make(state=1, conc=1)
+        s.add(0, 4, 5)
+        s.add(1, 4, 5)
+        s.pump()
+        self.assertEqual(len(s.running), 1)
+        self.assertTrue(s.abort(0))
+        self.assertEqual(len(s.running), 0)
+        self.assertEqual(s.coord.kv_used_total, 0)
+        self.assertEqual(s.coord.state_used_total, 0)
+        self.assertEqual(s.done[-1].seq_id, 0)
+        # the freed resources must let the next request in
+        self.assertEqual(s.pump(), [1])
+
+    def test_abort_waiting_removes_from_queue(self):
+        s = self.make(state=1, conc=1)
+        s.add(0, 1, 1)
+        s.add(1, 1, 1)
+        s.pump()
+        self.assertTrue(s.abort(1))
+        self.assertEqual(s.waiting_count, 0)
+        self.assertFalse(s.abort(42))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

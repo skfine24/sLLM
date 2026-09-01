@@ -10,19 +10,26 @@ def greedy(logits) -> int:
 
 
 def apply_repetition_penalty(logits, penalized_ids, penalty: float) -> np.ndarray:
-    """Penalize already-seen token ids: logit[id] /= penalty (penalty > 1).
+    """Penalize already-seen token ids (HF-style, applied to raw logits):
 
-    Applied to raw logits before temperature/softmax (HF-style). Returns a
-    copy; `penalized_ids` is the token history (typically prompt + generated).
+        logit[id] = logit[id] / penalty   if logit[id] > 0
+        logit[id] = logit[id] * penalty   if logit[id] < 0
+
+    so penalty > 1 always REDUCES the token's probability (dividing a
+    negative logit would otherwise reward it). Always returns a copy.
     """
     logits = np.asarray(logits, dtype=np.float64)
+    out = logits.copy()
     if penalty is None or penalty <= 0 or penalty == 1.0 or penalized_ids is None:
-        return logits
+        return out
     pids = np.asarray(penalized_ids, dtype=np.int64)
     if pids.size == 0:
-        return logits
-    out = logits.copy()
-    out[pids] = out[pids] / penalty
+        return out
+    pids = pids[(pids >= 0) & (pids < out.size)]
+    if pids.size == 0:
+        return out
+    vals = out[pids]
+    out[pids] = np.where(vals < 0, vals * penalty, vals / penalty)
     return out
 
 
@@ -39,7 +46,8 @@ def sample(
     - top_k keeps only the k largest logits (soft counts).
     - top_p keeps the smallest set whose cumulative prob >= top_p.
     """
-    rng = rng or np.random.default_rng()
+    if rng is None:
+        rng = np.random.default_rng()
     logits = np.asarray(logits, dtype=np.float64)
     if temperature is not None and temperature > 0:
         logits = logits / temperature
@@ -58,6 +66,9 @@ def sample(
         mask = np.zeros_like(probs, dtype=bool)
         mask[keep] = True
         probs = np.where(mask, probs, 0.0)
+        s = probs.sum()
+        if s > 0:
+            probs = probs / s  # renormalize so top-p sees a true distribution
 
     if top_p is not None:
         order = np.argsort(probs)[::-1]
@@ -73,4 +84,5 @@ def sample(
         return greedy(logits)
     probs = probs / total
     r = rng.random()
-    return int(np.searchsorted(np.cumsum(probs), r))
+    idx = int(np.searchsorted(np.cumsum(probs), r))
+    return min(idx, int(probs.size) - 1)

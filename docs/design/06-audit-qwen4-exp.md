@@ -69,6 +69,31 @@ required engine component for qwen4_exp.
   `mtp.fc_embedding.weight` + `mtp.fc_hidden.weight` (two 2H->H fcs, instead of
   qwen3_5's single `mtp.fc`).
 
+Phase 6 status:
+- Batched (S>1) MTP hyper-injection implemented in `ref/qwen4_exp_pipeline._forward`
+  (layer-major sequential positions, exact per-token equivalence to S
+  single-token calls; gate: `tests/test_qwen4_exp_pipeline.py::
+  test_batched_hyper_injection_matches_sequential`).
+- PLE determinism core extracted to numpy oracle `ref/qwen4_exp_ple.py`
+  (prime layout, splitmix64 multipliers, shift-right-ignore-eos, ngram hashing,
+  PLE feature cell with short conv) -- gates:
+  `tests/test_qwen4_exp_ple.py`.
+- PLE is WIRED into the pipeline: `hyper += PLE` at each PLE layer
+  (`_ple_forward`, upstream DecoderLayer.forward:1217-1220) with the shared
+  ngram context advanced per chunk and per-layer conv state carried;
+  `ple_input_ids` threads token ids through the hyper-injection/MTP path.
+  The ngram embedding table, key/value/conv projections come from the PLE
+  checkpoint names (`layers.{i}.ple.*`); tiny fixture emits them via
+  `tiny_qwen4_exp_ple_cfg`/`_q4_emit_ple`. Gates:
+  `tests/test_qwen4_exp_pipeline.py::test_ple_prefill_decode_parity`,
+  `::test_ple_changes_logits`, `::test_ple_incremental_batched_same_as_sequential`
+  and `tests/test_qwen4_exp_ple.py::test_short_conv_carried_state_matches_single_call`.
+- NOT included: the ngram-embedding usage in the MoE router is NOT present in
+  upstream `Qwen4ExpTextTopKRouter` (it is a plain dense softmax-topk over the
+  hidden stream -- the ngram influence reaches routing only via the PLE feature
+  added to the hyper stream, which IS implemented). Full torch parity of the
+  PLE cell vs the vendored reference remains the cluster (l5) golden step.
+
 ## 8. FP8 layout
 
 `quantization_config`: `fp8 / e4m3 / dynamic`, `weight_block_size [128,128]`,

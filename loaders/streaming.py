@@ -26,10 +26,11 @@ import os
 
 import numpy as np
 
-from .fp8 import dequant_weight_blocked
+from .fp8 import dequant_weight_auto, dequant_weight_blocked
 from .safetensors_reader import (
     TensorSpec,
     decode_bf16_array,
+    decode_e5m2_array,
     read_header,
 )
 
@@ -65,11 +66,11 @@ class ShardFile:
         if hit is not None:
             return hit
         dtype = {
-            "F8_E4M3": np.uint8, "F8_E5M2": np.uint8, "BF16": np.uint16,
-            "F64": np.float64, "F32": np.float32, "F16": np.float16,
-            "I64": np.int64, "I32": np.int32, "I16": np.int16, "I8": np.int8,
-            "U64": np.uint64, "U32": np.uint32, "U16": np.uint16,
-            "U8": np.uint8, "BOOL": np.bool_,
+            "F8_E4M3": np.uint8, "F8_E5M2": np.uint8, "F8_E8M0": np.uint8,
+            "BF16": np.uint16, "F64": np.float64, "F32": np.float32,
+            "F16": np.float16, "I64": np.int64, "I32": np.int32,
+            "I16": np.int16, "I8": np.int8, "U64": np.uint64, "U32": np.uint32,
+            "U16": np.uint16, "U8": np.uint8, "BOOL": np.bool_,
         }[spec.dtype]
         n_items = int(np.prod(spec.shape)) if spec.shape else 1
         arr = np.memmap(self.path, dtype=dtype, mode="r",
@@ -83,7 +84,10 @@ class ShardFile:
         arr = self.raw(name)
         if spec.dtype == "BF16":
             return decode_bf16_array(arr)
-        if spec.dtype == "F8_E4M3":
+        if spec.dtype == "F8_E5M2":
+            # decode to float32 so E5M2 can never be misread as E4M3
+            return decode_e5m2_array(arr)
+        if spec.dtype in ("F8_E4M3", "F8_E8M0"):
             return np.asarray(arr)  # raw uint8, dequant is explicit
         return np.asarray(arr)
 
@@ -162,35 +166,45 @@ class CheckpointIndex:
 class LazyWeightTable:
     """Per-tensor on-demand weight access for the runtime.
 
-    Quantized tensors (`X.weight` with an `X.weight_scale_inv` companion) are
-    stored on disk as F8_E4M3 + per-[block] inverse scales; `get()` keeps them
-    raw and `dequant()` materializes float32 for exactly one tensor. Scales
-    may be stored as F32 or BF16; both surface as float32.
+    Quantized tensors are `X.weight` with a scale companion named by
+    `scale_suffix`:
+      - default `_scale_inv`   APPENDS the suffix: `X.weight_scale_inv`
+        (Qwen-style F32/BF16 inverse scales);
+      - a leading-dot suffix like `.scale` REPLACES the `.weight` tail:
+        `X.scale` (DeepSeek-style E8M0/ue8m0 scales).
+    `dequant()` picks the block format from the scale geometry.
     """
 
     def __init__(self, index: CheckpointIndex,
-                 block: tuple[int, int] = (128, 128)):
+                 block: tuple[int, int] = (128, 128),
+                 scale_suffix: str = "_scale_inv"):
         self.index = index
         self.block = block
+        self.suffix = scale_suffix
 
     def names(self) -> list[str]:
         return self.index.names()
 
     def is_quantized(self, name: str) -> bool:
         return (name.endswith(".weight")
-                and name + "_scale_inv" in self.index.weight_map)
+                and self.companion(name) in self.index.weight_map)
+
+    def companion(self, name: str) -> str:
+        if self.suffix.startswith("."):
+            return name[: -len(".weight")] + self.suffix
+        return name + self.suffix
 
     def get(self, name: str) -> np.ndarray:
         return self.index.get(name)
 
     def scale(self, name: str) -> np.ndarray:
-        return self.index.get(name + "_scale_inv")
+        return self.index.get(self.companion(name))
 
     def dequant(self, name: str) -> np.ndarray:
         if not self.is_quantized(name):
             return self.index.get(name)
-        return dequant_weight_blocked(self.index.get(name), self.scale(name),
-                                      self.block[0], self.block[1])
+        return dequant_weight_auto(self.index.get(name), self.scale(name),
+                                   self.block)
 
     def layer(self, layer_idx: int, prefix: str = "model.language_model") -> dict:
         """All tensors of decoder layer `layer_idx` (fp8 tensors dequantized,
@@ -198,7 +212,7 @@ class LazyWeightTable:
         p = f"{prefix}.layers.{layer_idx}."
         out = {}
         for n in self.index.filter(p):
-            if n.endswith("_scale_inv"):
+            if n.endswith(self.suffix):
                 continue
             out[n] = self.dequant(n)
         return out

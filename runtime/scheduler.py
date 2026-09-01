@@ -25,6 +25,7 @@ class Request:
     seq_id: int
     prompt_len: int
     max_new: int
+    use_state: bool = True       # needs a recurrent-state slot (hybrid models)
     position: int = 0            # prompt tokens already prefilled
     tokens_generated: int = 0
     finished: bool = False
@@ -78,8 +79,12 @@ class Scheduler:
 
     # -- public api ---------------------------------------------------------
 
-    def add(self, seq_id: int, prompt_len: int, max_new: int) -> None:
-        self._waiting.append(Request(seq_id=seq_id, prompt_len=prompt_len, max_new=max_new))
+    def add(self, seq_id: int, prompt_len: int, max_new: int,
+            use_state: bool = True) -> None:
+        if any(r.seq_id == seq_id for r in self._waiting) or seq_id in self._running:
+            raise ValueError(f"seq {seq_id} already registered")
+        self._waiting.append(Request(seq_id=seq_id, prompt_len=prompt_len,
+                                     max_new=max_new, use_state=use_state))
 
     def table(self, seq_id: int) -> BlockTable:
         return self.coord.tables[seq_id]
@@ -92,13 +97,42 @@ class Scheduler:
     def waiting_count(self) -> int:
         return len(self._waiting)
 
+    def abort(self, seq_id: int) -> bool:
+        """Cancel a request (client disconnect): release its blocks/state and
+        remove it. Returns True if a running/waiting request was cancelled."""
+        req = self._running.pop(seq_id, None)
+        if req is not None:
+            self.coord.free_sequence(seq_id)
+            req.finished = True
+            self.done.append(req)
+            return True
+        for r in list(self._waiting):
+            if r.seq_id == seq_id:
+                self._waiting.remove(r)
+                r.finished = True
+                self.done.append(r)
+                return True
+        return False
+
     def pump(self) -> list[int]:
-        """Admit waiting requests while resources allow. Returns admitted ids."""
+        """Admit waiting requests while resources allow. Returns admitted ids.
+
+        A request that does not fit is SKIPPED (not a hard stop), so a single
+        large request cannot permanently block smaller ones queued behind it
+        (backfill); the not-fitting request stays at the head of the queue."""
         admitted = []
-        while self._waiting and self._accepts(self._waiting[0]):
+        skipped = []
+        while self._waiting:
             req = self._waiting.popleft()
-            self._admit(req)
-            admitted.append(req.seq_id)
+            if self._accepts(req):
+                try:
+                    self._admit(req)
+                    admitted.append(req.seq_id)
+                    continue
+                except OutOfCapacity:
+                    pass  # lost a race with a co-admit; keep waiting
+            skipped.append(req)
+        self._waiting.extendleft(reversed(skipped))
         return admitted
 
     def schedule(self) -> Schedule:
@@ -126,20 +160,21 @@ class Scheduler:
         if action.phase == "prefill":
             req.position = min(req.prompt_len, req.position + action.length)
         else:
-            req.tokens_generated += 1
+            req.tokens_generated += action.length if action.length > 0 else 1
             req.position = req.prompt_len
         if eos or (req.position >= req.prompt_len and req.tokens_generated >= req.max_new):
             self._finish(req)
 
     def _admit(self, req: Request) -> None:
         worst = self.coord.blocks_for_tokens(req.prompt_len + req.max_new, self.block_size)
-        self.coord.new_sequence(req.seq_id, worst * self.block_size, self.block_size)
+        self.coord.new_sequence(req.seq_id, worst * self.block_size,
+                                self.block_size, use_state=req.use_state)
         self._running[req.seq_id] = req
 
     def _accepts(self, req: Request) -> bool:
         if len(self._running) >= self.max_concurrency:
             return False
-        if not self.coord.state.free_count:
+        if req.use_state and not self.coord.state.free_count:
             return False
         worst = self.coord.blocks_for_tokens(req.prompt_len + req.max_new, self.block_size)
         return self.coord.kv.free_count >= worst

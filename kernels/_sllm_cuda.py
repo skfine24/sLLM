@@ -145,7 +145,11 @@ def _ptr(a: np.ndarray):
 
 def _check(rc: int) -> None:
     if rc != 0:
-        raise RuntimeError(load().sllm_last_error().decode())
+        try:
+            err = load().sllm_last_error()
+        except Exception:
+            err = None
+        raise RuntimeError(err.decode() if err else f"sllm call failed (rc={rc})")
 
 
 def rms_norm(x: np.ndarray, weight: np.ndarray, eps: float = 1e-6) -> np.ndarray:
@@ -206,6 +210,14 @@ class DeviceBuffer:
                                + load().sllm_last_error().decode())
         self._closed = False
 
+    def __del__(self):
+        # GC safety net: exception paths that miss .free() must not strand
+        # device memory for the process lifetime.
+        try:
+            self.free()
+        except Exception:
+            pass
+
     @property
     def ptr(self) -> int:
         if self._closed:
@@ -258,11 +270,14 @@ class DeviceView:
             raise ValueError("view out of range")
         self._base = base
         self.nbytes = nbytes
-        self._ptr = base.ptr + off_bytes
+        self._off = off_bytes
+        base.ptr  # validates the base is live at construction time
 
     @property
     def ptr(self) -> int:
-        return self._ptr
+        # resolved through the base so a freed base raises instead of
+        # handing out a stale (wild) device pointer
+        return self._base.ptr + self._off
 
 
 def to_bf16(arr: np.ndarray) -> np.ndarray:
@@ -270,12 +285,6 @@ def to_bf16(arr: np.ndarray) -> np.ndarray:
     u = np.asarray(arr, dtype=np.float32).view(np.uint32)
     r = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
     return np.ascontiguousarray(r)
-
-    def __del__(self):
-        try:
-            self.free()
-        except Exception:
-            pass
 
 
 def to_device(arr: np.ndarray) -> DeviceBuffer:
@@ -343,7 +352,12 @@ def gated_delta_step(q: np.ndarray, k: np.ndarray, v: np.ndarray,
     v = np.ascontiguousarray(v, dtype=np.float32)
     g = np.ascontiguousarray(g, dtype=np.float32)
     beta = np.ascontiguousarray(beta, dtype=np.float32)
-    state = np.ascontiguousarray(state, dtype=np.float32)
+    # The kernel updates `state` IN PLACE. ascontiguousarray() would silently
+    # copy a non-fp32/non-contiguous input and the recurrent state would then
+    # FREEZE with rc==0 — refuse instead.
+    if state.dtype != np.float32 or not state.flags["C_CONTIGUOUS"]:
+        raise ValueError("gated_delta_step state must be fp32 C-contiguous "
+                         "(it is updated in place; a copy would be discarded)")
     Vh, Kd, Vd = state.shape
     if q.shape != (Vh, Kd) or k.shape != (Vh, Kd) or v.shape != (Vh, Vd):
         raise ValueError("shape mismatch in gated_delta_step")

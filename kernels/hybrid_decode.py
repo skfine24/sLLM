@@ -38,6 +38,12 @@ def gpu_hybrid_decode_step(cache, weights, recipe, last_id: int) -> np.ndarray:
     `cache` is the numpy `IncrementalCache` from a numpy `prefill`; its K/V,
     recurrent state and conv window are updated in place (same contract as the
     numpy decode path).
+
+    Failure semantics: the KV, conv window and n_ctx are STAGED and committed
+    only after the whole step succeeds, so a failed step leaves them intact
+    for the numpy fallback. LIMITATION: the GatedDeltaNet kernel updates the
+    recurrent state in place per layer; a failure at a LATER layer leaves the
+    earlier GDN layers advanced (re-prefill before retrying with numpy).
     """
     from ref import incremental as inc  # local import to avoid a cycle
 
@@ -46,11 +52,17 @@ def gpu_hybrid_decode_step(cache, weights, recipe, last_id: int) -> np.ndarray:
     nh, hd = fa.num_heads, fa.head_dim
 
     embed_w = weights[f"{_TEXTP}.embed_tokens.weight"]
+    if last_id < 0:
+        raise ValueError(f"negative token id {last_id}")
     hidden = embed_w[[last_id]].astype(np.float32)  # (1, H)
 
     pos = cache.n_ctx
-    cache.n_ctx += 1
     cos, sin = inc._pos_cos_sin(cache.theta, recipe.rotary_dim(), pos)
+
+    # staged mutations, committed only after the whole step succeeds
+    new_conv: dict[int, np.ndarray] = {}
+    new_k: dict[int, np.ndarray] = {}
+    new_v: dict[int, np.ndarray] = {}
 
     for i, bt in enumerate(recipe.layer_types):
         in_norm = weights[f"{_TEXTP}.layers.{i}.input_layernorm.weight"]
@@ -69,7 +81,9 @@ def gpu_hybrid_decode_step(cache, weights, recipe, last_id: int) -> np.ndarray:
             win = np.concatenate([cache.conv_win[i], mixed[None]], axis=-1)
             conv = qq.causal_conv1d_depthwise(win[:, :, -kc:], fw["w_conv"], activation="silu")
             mixed_conv = np.transpose(conv[:, :, -1:], (0, 2, 1))  # (1,1,C)
-            cache.conv_win[i] = win[:, :, -(kc - 1):]
+            # history window keeps the last (kc-1) columns; with kc==1 the
+            # history is EMPTY (`-(0):` would wrongly keep the whole window)
+            new_conv[i] = win[:, :, -(kc - 1):] if kc > 1 else win[:, :, :0]
 
             query, key, value = qq._split(mixed_conv, [key_dim, key_dim, value_dim])
             query = query.reshape(1, 1, -1, la.key_head_dim)
@@ -110,9 +124,11 @@ def gpu_hybrid_decode_step(cache, weights, recipe, last_id: int) -> np.ndarray:
                 _proj(h_in, fw["w_k"]).reshape(1, kvh, 1, hd), fw["k_norm_w"], eps=eps)
             v = _proj(h_in, fw["w_v"]).reshape(1, kvh, 1, hd)
             q2, k = qq.apply_rotary_pos_emb(q2, k, cos[None, None], sin[None, None])
-            cache.k[i] = np.concatenate([cache.k[i], k[0]], axis=1)
-            cache.v[i] = np.concatenate([cache.v[i], v[0]], axis=1)
-            kt, vt = inc._replicate(cache.k[i], cache.v[i], n_rep)
+            ki = np.concatenate([cache.k[i], k[0]], axis=1)
+            vi = np.concatenate([cache.v[i], v[0]], axis=1)
+            new_k[i] = ki
+            new_v[i] = vi
+            kt, vt = inc._replicate(ki, vi, n_rep)
             attn = ck.attention_decode(q2[0, :, 0, :], kt, vt, hd ** -0.5)
             attn = attn.reshape(1, nh * hd) * qq.sigmoid(gate.reshape(1, -1))
             h = _proj(attn, fw["w_o"])
@@ -127,4 +143,13 @@ def gpu_hybrid_decode_step(cache, weights, recipe, last_id: int) -> np.ndarray:
         hidden = ck.elwise_add(residual, hl)
 
     hidden = qq.rms_norm(hidden, weights[f"{_TEXTP}.norm.weight"], eps=eps)
-    return _proj(hidden, weights["lm_head.weight"])[0]
+    out = _proj(hidden, weights["lm_head.weight"])[0]
+
+    # commit: the step fully succeeded
+    for i, arr in new_conv.items():
+        cache.conv_win[i] = arr
+    for i in new_k:
+        cache.k[i] = new_k[i]
+        cache.v[i] = new_v[i]
+    cache.n_ctx += 1
+    return out

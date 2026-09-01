@@ -17,12 +17,24 @@ class TopologyError(ValueError):
     pass
 
 
-# Defaults from docs/design/08 sec.1 (verified 2026-08-29); overridable per
-# deployment via config.env / environment variables (env_config precedence).
-HEAD_EXTERNAL = _env("SLLM_HEAD_IP", "192.168.0.250")
-WORKER_EXTERNAL = _env("SLLM_WORKER_IP", "192.168.0.231")
-HEAD_PAIR_IP = _env("SLLM_HEAD_PAIR_IP", "10.100.25.1")
-WORKER_PAIR_IP = _env("SLLM_WORKER_PAIR_IP", "10.100.25.2")
+def _names() -> dict:
+    """Resolve cluster names lazily (env/config.env can change after import;
+    an import-time read would bake stale values and mask configuration
+    problems). Defaults from docs/design/08 sec.1 (verified 2026-08-29)."""
+    return {
+        "head": _env("SLLM_HEAD_IP", "192.168.0.250"),
+        "worker": _env("SLLM_WORKER_IP", "192.168.0.231"),
+        "head_pair": _env("SLLM_HEAD_PAIR_IP", "10.100.25.1"),
+        "worker_pair": _env("SLLM_WORKER_PAIR_IP", "10.100.25.2"),
+    }
+
+
+# Back-compat module constants (resolved once; dgx_spark_pair() re-resolves
+# lazily so a config.env change after import is honoured).
+HEAD_EXTERNAL = _names()["head"]
+WORKER_EXTERNAL = _names()["worker"]
+HEAD_PAIR_IP = _names()["head_pair"]
+WORKER_PAIR_IP = _names()["worker_pair"]
 
 
 @dataclass(frozen=True)
@@ -43,9 +55,10 @@ class ClusterTopology:
 
     @classmethod
     def dgx_spark_pair(cls) -> "ClusterTopology":
+        n = _names()
         return cls(ranks=(
-            RankSpec(0, HEAD_EXTERNAL, HEAD_PAIR_IP),
-            RankSpec(1, WORKER_EXTERNAL, WORKER_PAIR_IP),
+            RankSpec(0, n["head"], n["head_pair"]),
+            RankSpec(1, n["worker"], n["worker_pair"]),
         ))
 
     @classmethod

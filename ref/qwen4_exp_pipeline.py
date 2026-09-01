@@ -35,7 +35,10 @@ Shapes verified: q_proj [nh*2*hd, H] (q|gate interleaved per head),
 indexer.index_qk_proj [(idx_heads+1)*idx_dim, H],
 input_mix_weight_down [lowrank, hc*H], block_inject_weight [hc, hc*H].
 
-Out of scope (Q3+): PLE/ngram (guarded), MTP, vision, TP, fp8 loading.
+Out of scope (Q3+): full PLE wiring (foundation oracle in ref/qwen4_exp_ple.py,
+Phase 6 -- hyper stream +PLE and ngram-protected router are successor work),
+MTP head, vision, TP, fp8 loading. Batched (S>1) hyper-injection for MTP
+draft-extend IS implemented (layer-major sequential positions).
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ import numpy as np
 
 from . import qwen3_5 as qq
 from . import qwen4_exp as qe
+from . import qwen4_exp_ple as ple
 
 _TEXT = "model.language_model"
 
@@ -80,8 +84,17 @@ class Qwen4ExpCfg:
     top_k: int = 10
     moe_inter: int = 640
     shared_inter: int = 640
-    # unsupported here
+    # PLE (ngram / pronomial lexical embedding; ple_layer_ids are 1-indexed)
     ple_layer_ids: tuple = field(default=())
+    ple_embed_dim: int = 8
+    ngram_size: int = 2
+    heads_per_ngram: int = 2
+    ngram_vocab_size_base: int = 16
+    ple_conv_kernel_size: int = 3
+    ple_make_divisible: int = 64
+    seed: int = 0
+    eos_token_id: int = 0
+    vocab_size: int = 32
 
     @property
     def rotary_dim(self) -> int:
@@ -123,13 +136,30 @@ class Qwen4ExpCfg:
             moe_inter=mlp.intermediate_size,
             shared_inter=mlp.shared_expert_intermediate_size,
             ple_layer_ids=tuple(ple.get("layer_ids", ())),
+            ple_embed_dim=int(ple.get("embed_dim", spec.get("ple_embed_dim", 8))),
+            ngram_size=int(ple.get("ngram_size", spec.get("ngram_size", 2))),
+            heads_per_ngram=int(ple.get("heads_per_ngram",
+                                        spec.get("heads_per_ngram", 2))),
+            ngram_vocab_size_base=int(ple.get(
+                "vocab_size_base", spec.get("ngram_vocab_size_base", 16))),
+            ple_conv_kernel_size=int(ple.get(
+                "conv_kernel_size", spec.get("ple_conv_kernel_size", 3))),
+            seed=int(ple.get("seed", spec.get("seed", 0))),
+            vocab_size=int(recipe.vocab_size),
         )
 
     def validate(self) -> None:
-        if self.ple_layer_ids:
-            raise NotImplementedError("PLE is deferred to milestone Q5")
         if self.hc_count < 2:
             raise ValueError("qwen4_exp requires hc_count >= 2")
+        if self.ple_layer_ids:
+            ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
+            if self.ple_embed_dim % ngram_heads:
+                raise ValueError(
+                    f"ple_embed_dim {self.ple_embed_dim} must be divisible by "
+                    f"ngram_heads {(self.ngram_size - 1) * self.heads_per_ngram}")
+            if any(i < 1 or i > len(self.layer_types)
+                   for i in self.ple_layer_ids):
+                raise ValueError("ple_layer_ids are 1-indexed layer numbers")
         rot = self.rotary_dim
         if rot <= 0 or rot % 2 or rot > self.idx_dim:
             raise ValueError(
@@ -175,6 +205,8 @@ class Qwen4ExpState:
     def __init__(self, cfg: Qwen4ExpCfg):
         self.cfg = cfg
         self.n_ctx = 0
+        # trailing ngram context shared by all PLE layers (None -> eos pad)
+        self.ple_ctx: np.ndarray | None = None
         self.layers: list[dict] = []
         for bt in cfg.layer_types:
             if bt == "linear_attention":
@@ -183,6 +215,7 @@ class Qwen4ExpState:
                 self.layers.append({
                     "gdn": None,
                     "conv_win": np.zeros((1, c, cfg.lin_conv - 1), np.float32),
+                    "ple_conv": None,
                 })
             else:
                 self.layers.append({
@@ -190,6 +223,7 @@ class Qwen4ExpState:
                     "v": np.zeros((cfg.attn_kv_heads, 0, cfg.attn_head_dim), np.float32),
                     "tok_k": np.zeros((0, 1, cfg.idx_dim), np.float32),
                     "ck": np.zeros((0, cfg.idx_dim), np.float32),
+                    "ple_conv": None,
                 })
 
     def state_bytes(self) -> int:
@@ -459,6 +493,47 @@ def _qsa_block_step(h1, weights, i, cfg, st, pos):
 # model-level forward
 # ---------------------------------------------------------------------------
 
+def _ple_w(weights, i):
+    p = f"{_TEXT}.layers.{i}.ple"
+    return dict(
+        table=weights[f"{p}.ple_embedding.ngram_embedding.weight"],
+        key=weights[f"{p}.key_proj.weight"],
+        value=weights[f"{p}.value_proj.weight"],
+        conv=weights[f"{p}.conv1d.weight"],
+        nk=weights[f"{p}.norm_key.weight"],
+        nq=weights[f"{p}.norm_query.weight"],
+        nc=weights[f"{p}.norm_conv.weight"],
+    )
+
+
+def _ple_forward(hyper, ple_ids, weights, i, cfg, st, prev_ctx):
+    """P++LE feature on the hyper stream (upstream PLELayer.forward).
+
+    Adds the ngram feature to the hyper stream (DecoderLayer.forward:1217-1220).
+    `prev_ctx` = trailing ngram tokens before this chunk (shared, from the
+    whole sequence); `st["ple_conv"]` (per-layer conv state) is updated here.
+    the shared ngram context is advanced by _forward after the chunk.
+    """
+    p = _ple_w(weights, i)
+    index = cfg.ple_layer_ids.index(i + 1)
+    layout = ple.NGramLayout(
+        vocab_size=cfg.vocab_size, ngram_size=cfg.ngram_size,
+        heads_per_ngram=cfg.heads_per_ngram,
+        ngram_vocab_size_base=cfg.ngram_vocab_size_base,
+        ple_layer_index=index,
+        make_ngram_vocab_size_divisible_by=cfg.ple_make_divisible,
+        seed=cfg.seed)
+    embs = ple.ngram_embeddings(
+        ple_ids, layout, p["table"],
+        previous_context=prev_ctx, eos_token_id=cfg.eos_token_id)
+    out, conv = ple.ple_feature(
+        hyper, embs, p["key"], p["value"], p["conv"],
+        p["nk"], p["nq"], p["nc"], cfg.hc_count, cfg.hidden,
+        cfg.rms_norm_eps, dilation=cfg.ngram_size, conv_state=st["ple_conv"])
+    st["ple_conv"] = conv
+    return out
+
+
 def _layer_block(h, weights, i, cfg, st, decode_pos):
     """Attention block dispatch (h: [1, S, H])."""
     if decode_pos is None:
@@ -471,20 +546,20 @@ def _layer_block(h, weights, i, cfg, st, decode_pos):
 
 
 def _forward(ids_or_state, weights, cfg, last_id=None, hyper_in=None,
-             return_hyper=False):
+             return_hyper=False, ple_input_ids=None):
     """Shared driver: prefill (ids), one decode step (state, last_id), or a
     hyper-injection run (state|None, hyper_in) for the MTP draft model
     (oracle/upstream/sglang/qwen4_exp_mtp.py feeds fused inputs directly).
+
+    `ple_input_ids` supplies the token ids the PLE/ngram path needs for the
+    current chunk (default: the prefill ids / the decode `last_id`; REQUIRED
+    for the hyper-injection path when PLE layers are configured).
 
     `return_hyper` additionally returns the PRE-final-combine hyper tensor
     (1, S, hc*H) — the tensor the MTP consumes as `spec_info.hidden_states`."""
     cfg.validate()
     if hyper_in is not None:
         hyper_in = np.asarray(hyper_in, dtype=np.float32)
-    if hyper_in is not None and hyper_in.shape[1] > 1:
-        raise NotImplementedError(
-            "hyper-injection only supports single-token draft steps (v1); "
-            "batched draft-extend is a C-phase feature")
     prefill = last_id is None and hyper_in is None
     state = None
     if prefill:
@@ -503,6 +578,24 @@ def _forward(ids_or_state, weights, cfg, last_id=None, hyper_in=None,
         s = ids.shape[1]
     hc, hs, eps = cfg.hc_count, cfg.hidden, cfg.rms_norm_eps
 
+    # token ids the PLE/ngram path sees for this chunk
+    if cfg.ple_layer_ids:
+        if prefill or last_id is not None:
+            ple_ids = ids
+        elif ple_input_ids is not None:
+            ple_ids = np.asarray(ple_input_ids, dtype=np.int64)
+            if ple_ids.ndim == 1:
+                ple_ids = ple_ids[None, :]
+        else:
+            raise ValueError(
+                "PLE layers configured: the hyper-injection path needs "
+                "`ple_input_ids` for the draft tokens")
+        if ple_ids.shape[1] != s:
+            raise ValueError(
+                f"ple_input_ids width {ple_ids.shape[1]} != chunk {s}")
+    else:
+        ple_ids = None
+
     if hyper_in is None:
         embed_w = weights[f"{_TEXT}.embed_tokens.weight"]
         emb = embed_w[ids].astype(np.float32)              # (1, S, H)
@@ -512,6 +605,34 @@ def _forward(ids_or_state, weights, cfg, last_id=None, hyper_in=None,
         st = state.layers[i]
         a_norm, a_dn, a_up, a_inj = _hc_w(weights, f"{i}.attn_hyper_connection")
         m_norm, m_dn, m_up, m_inj = _hc_w(weights, f"{i}.mlp_hyper_connection")
+
+        if i + 1 in cfg.ple_layer_ids:
+            hyper = hyper + _ple_forward(hyper, ple_ids, weights, i, cfg, st,
+                                         state.ple_ctx)
+
+        if hyper_in is not None and s > 1:
+            # Batched draft-extend: the recurrent caches (GDN state, conv
+            # window, QSA k/v/tok_k/ck) are causal, so the S positions run
+            # sequentially WITHIN each layer (layer-major order) -- advancing
+            # this layer's own state in place. Math is identical to S
+            # single-token decode_step calls; only the fused all-layer input
+            # distinguishes it (the MTP/sglang path).
+            hp = hyper.copy()
+            for p in range(s):
+                pos = state.n_ctx + p
+                mixed, normed = qe.hc_mix(hp[:, p:p + 1], a_norm, a_dn, a_up,
+                                          hc, hs, eps)
+                block = _layer_block(mixed, weights, i, cfg, st, pos)
+                hp[:, p:p + 1] = qe.hc_combine(block, hp[:, p:p + 1], normed,
+                                               a_inj, hc, hs)
+                mixed2, normed2 = qe.hc_mix(hp[:, p:p + 1], m_norm, m_dn, m_up,
+                                            hc, hs, eps)
+                moe_out = _moe_forward(mixed2, _moe_w(weights, i, cfg),
+                                       cfg).astype(hp.dtype)
+                hp[:, p:p + 1] = qe.hc_combine(moe_out, hp[:, p:p + 1], normed2,
+                                               m_inj, hc, hs)
+            hyper = hp
+            continue
 
         mixed, normed = qe.hc_mix(hyper, a_norm, a_dn, a_up, hc, hs, eps)
         block = _layer_block(mixed, weights, i, cfg, st,
@@ -523,6 +644,12 @@ def _forward(ids_or_state, weights, cfg, last_id=None, hyper_in=None,
         hyper = qe.hc_combine(moe_out, hyper, normed2, m_inj, hc, hs)
 
     state.n_ctx += s
+    if ple_ids is not None:
+        # advance the shared ngram context (identical tokens across layers)
+        prev = state.ple_ctx
+        hist = (np.concatenate([prev, ple_ids], axis=-1)
+                if prev is not None else ple_ids)
+        state.ple_ctx = hist[:, -(cfg.ngram_size - 1):]
     f_norm, f_dn, f_up = (
         weights[f"{_TEXT}.hyper_connection_mixer.hc_norm.weight"],
         weights[f"{_TEXT}.hyper_connection_mixer.input_mix_weight_down.weight"],

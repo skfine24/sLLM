@@ -9,6 +9,7 @@ import numpy as np
 
 from ref import qwen4_exp_mtp as qm
 from ref import qwen4_exp_pipeline as qp
+from runtime import spec as rspec
 from serving.dev_model import (
     tiny_qwen4_exp_cfg,
     tiny_qwen4_exp_mtp_weights,
@@ -146,6 +147,55 @@ class TestGreedyIdentity(unittest.TestCase):
         ids = [4, 4, 12, 30]
         got, _, _ = qm.generate_greedy_mtp(ids, w, cfg, 6, num_draft=1)
         self.assertEqual(got, qp.generate_greedy(ids, w, cfg, 6))
+
+    def test_mtp_greedy_identity_with_ple_main(self):
+        # NEW (Phase 6): the MAIN model runs PLE (hyper += ngram feature on
+        # layer 2) while the MTP draft driver is PLE-free (mcfg clears
+        # ple_layer_ids) -- the two hyper streams must stay consistent across
+        # the fused boundary (decode_step_full returns the PLE-augmented
+        # post-step hyper row that the draft fuses).
+        from serving.dev_model import tiny_qwen4_exp_ple_cfg
+        rng = np.random.default_rng(9)
+        cfg = tiny_qwen4_exp_ple_cfg()
+        w = tiny_qwen4_exp_mtp_weights(cfg, tiny_qwen4_exp_weights(cfg, rng),
+                                       rng)
+        ids = [3, 11, 1, 7, 12, 3]
+        want = qp.generate_greedy(ids, w, cfg, 10)
+        got, drafted, accepted = qm.generate_greedy_mtp(ids, w, cfg, 10,
+                                                        num_draft=2)
+        self.assertEqual(got, want)
+        self.assertGreater(drafted, 0)  # draft path actually exercised
+
+    def test_runtime_spec_entry_matches_greedy(self):
+        # runtime/spec.py entry wraps the incremental verify loop; the emitted
+        # tail must equal plain greedy generation, with PLE in the main model
+        from serving.dev_model import tiny_qwen4_exp_ple_cfg
+        for make_cfg in (tiny_qwen4_exp_cfg, tiny_qwen4_exp_ple_cfg):
+            rng = np.random.default_rng(4)
+            cfg = make_cfg()
+            w = tiny_qwen4_exp_mtp_weights(cfg, tiny_qwen4_exp_weights(cfg,
+                                                                       rng),
+                                           rng)
+            ids = [3, 11, 1, 7, 12, 3]
+            got = rspec.spec_decode_greedy_qwen4exp(cfg, w, ids, max_new=8,
+                                                    num_draft=2)
+            want = ids + qp.generate_greedy(ids, w, cfg, 8)
+            self.assertEqual(got, want)
+            self.assertLessEqual(len(got), len(ids) + 8)
+
+    def test_runtime_spec_entry_never_emits_stop(self):
+        rng = np.random.default_rng(12)
+        cfg = tiny_qwen4_exp_cfg()
+        w = tiny_qwen4_exp_mtp_weights(cfg, tiny_qwen4_exp_weights(cfg, rng),
+                                       rng)
+        ids = [1, 5, 9, 3, 27, 2, 8]
+        stop = (27, 9)
+        got = rspec.spec_decode_greedy_qwen4exp(cfg, w, ids, max_new=20,
+                                                num_draft=2, stop_ids=stop)
+        self.assertTrue(got[:len(ids)] == ids)
+        self.assertFalse(any(t in stop for t in got[len(ids):]),
+                         "a stop id was emitted")
+        # prompt ids may contain stop ids; only the EMITTED tail is guarded
 
 
 if __name__ == "__main__":

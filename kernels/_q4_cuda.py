@@ -219,8 +219,12 @@ def qsa_sparse_attn(q, k, v, slots, kvh, kcap, scale) -> np.ndarray:
     W = slots.shape[0]
     if k.shape != (kvh, kcap, hd) or v.shape != (kvh, kcap, hd):
         raise ValueError("k/v must be (kvh, kcap, hd) matching kcap")
-    if W and int(slots.max()) >= kcap:
-        raise ValueError("slot id exceeds kcap")
+    if W:
+        smin, smax = int(slots.min()), int(slots.max())
+        if smin < 0:
+            raise ValueError(f"slot id negative ({smin}); uninitialised topk?")
+        if smax >= kcap:
+            raise ValueError("slot id exceeds kcap")
     out = np.empty((nh, hd), np.float32)
     rc = _lib().sllm_q4_qsa_sparse_attn(
         _fp(q), _fp(k), _fp(v), _ip(slots),

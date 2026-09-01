@@ -52,11 +52,11 @@ class TestCfgFromRecipe(unittest.TestCase):
         self.assertEqual((cfg.idx_heads, cfg.idx_dim, cfg.idx_budget,
                           cfg.idx_ratio), (4, 128, 2048, 4))
         self.assertEqual((cfg.n_experts, cfg.top_k), (512, 10))
-        # PLE is deferred to Q5: the real knobs must trip the guard, never
-        # silently skip PLE layers.
+        # PLE is wired (Phase 6): the real knobs parse and validate, and the
+        # model runs with the ngram feature on the hyper stream.
         self.assertEqual(cfg.ple_layer_ids, (2,))
-        with self.assertRaises(NotImplementedError):
-            cfg.validate()
+        cfg.validate()  # no longer raises (PLE implemented)
+        self.assertEqual(cfg.ple_embed_dim, 2560)
 
 
 class TestEngineGreedyIdentity(unittest.TestCase):

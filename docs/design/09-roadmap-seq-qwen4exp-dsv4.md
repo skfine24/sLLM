@@ -47,6 +47,22 @@ unlocks the three NVFP4 Qwen checkpoints); MoE oracle shares the Q3 design
 | Q4 | Engine integration: arch `qwen4_exp` through executor (CPU incremental first), then device kernels (reuse fused dtype machinery; GDN scan + QSA sparse attention kernels) | regression 161 tests green |
 | Q5 | Full-model path: TP2 dual-node plan execution + T3 live parity vs deployed sglang/vLLM; MTP-hybrid + PLE/ngram spec decode last | T3 |
 
+Track Q status (updated 2026-09-01; regression 357 OK / 34 cluster-skip):
+- Q1/Q2/Q4 DONE (oracles, pipeline, tiny fixture, engine path).
+- PLE/ngram + MTP-hybrid (Q3+ item) DONE locally: ngram oracle
+  `ref/qwen4_exp_ple.py`, pipeline wiring `_ple_forward` (hyper `+= PLE`,
+  shared ngram ctx + per-layer conv state), MTP fusion/draft
+  `ref/qwen4_exp_mtp.py`, runtime entry `runtime/spec.py::
+  spec_decode_greedy_qwen4exp` (incl. batched S>1 hyper-injection). The MoE
+  router is a plain dense softmax-topk (ngram influence arrives via the PLE
+  feature on the hyper stream) -- no router change needed.
+- Q3 (real-subset noise floor): cluster-gated via `bench/q4_subset_parity.py`.
+- Q5 TP2 plan: local sharding exists (`loaders.tp_shard.Qwen4ExpSharding` +
+  `tp/`); dual-node T3 live parity = cluster. Vision tower (VP170, `out_hidden
+  2560`) is the remaining unimplemented Q3+ item -- the vendored
+  `modeling_qwen4_exp.py` rotary-length arithmetic is not locally
+  torch-verifiable (rope_dim vs head_dim), so the port stays cluster-gated.
+
 ### Track D — deepseek_v4 (after Track Q)
 
 | # | Deliverable | Parity gate |
@@ -56,6 +72,19 @@ unlocks the three NVFP4 Qwen checkpoints); MoE oracle shares the Q3 design
 | D3 | MoE V4: noaux_tc routing + sqrtsoftplus + top-6/shared-1 oracle, grouped-GEMM CUDA port | T0/T1 |
 | D4 | HDC (hc_mult 4, sinkhorn 20) + sparse index/hash components | T0/T1 |
 | D5 | Real-model: layer-subset parity -> TP2 dual-node (156 GB) -> DSPark spec decode + message encoder | T2/T3 |
+
+Track D status (updated 2026-09-01):
+- D1-D4 DONE: e2m1/ue8m0 loader (`loaders/fp8.py`, `tp_shard.DeepseekV4Sharding`),
+  MLA + rope-offset oracle with device-resident decode, noaux_tc/sqrtsoftplus/
+  top-6/shared-1 MoE oracle, HDC hc_mult-4 (incl. DSPark spec draft model).
+- D5 local parts DONE: `DeepseekV4SpecModel` + backing spec decode
+  (`runtime/spec.py::spec_decode_greedy_deepseek`, greedy-identity invariant),
+  vision tower + VL prefill/chat (`ref/vision_deepseek.py` bf16, torch-free),
+  message encoder (`serving/encoding_dsv4.py`, tool merge).
+- D5 cluster-gated: TP2 dual-node on the 156 GB checkpoint, real-checkpoint
+  OpenAI-vision E2E (`tests/test_real_checkpoint_cluster.py`), fused fp4/MLA
+  CUDA kernels (`kernels/_deepseek_cuda.py` + `cuda/deepseek.cu` parity stubs;
+  `.so`-gated tests skip locally).
 
 ## 4. Validation and regression rules
 

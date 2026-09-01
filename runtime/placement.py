@@ -65,7 +65,13 @@ class KVMemoryPlan:
     def from_recipe(cls, recipe, block_size: int = 16,
                     kv_avail_bytes: int | None = None) -> "KVMemoryPlan":
         mem = recipe.memory
-        bpt = kv_bytes_per_token(recipe, kv_bytes=2)  # BF16 KV; FP8 (1 B) with quant path
+        # The `device` backend stores fp32 buffers (kernels._sllm_cuda.to_device
+        # casts to fp32), so its plan must charge 4 B/element or the GB10 KV
+        # budget is silently 2x over-subscribed (the exact failure mode this
+        # module is meant to prevent). Host RAM is abundant: keep the nominal
+        # 2 B/element (BF16) figure there.
+        kv_bytes = 4 if mem.kv_placement == "device" else 2
+        bpt = kv_bytes_per_token(recipe, kv_bytes=kv_bytes)
         if kv_avail_bytes is not None:
             budget = int(kv_avail_bytes)
         elif mem.kv_placement == "host":
@@ -175,10 +181,20 @@ class DeviceKVBackend(KVBackend):
         ck = self._ck
         kb = ck.to_device(np.ascontiguousarray(k, dtype=np.float32))
         vb = ck.to_device(np.ascontiguousarray(v, dtype=np.float32))
-        self._bufs.setdefault(seq_id, {})[layer] = (kb, vb)
+        layers = self._bufs.setdefault(seq_id, {})
+        stale = layers.get(layer)
+        if stale is not None:
+            # a re-prefill overwrites: free the old device buffers first,
+            # otherwise every retry leaks 2 device buffers (OOM on GB10).
+            stale[0].free()
+            stale[1].free()
+        layers[layer] = (kb, vb)
 
     def gather(self, seq_id: int, layer: int):
-        kb, vb = self._bufs[seq_id][layer]
+        try:
+            kb, vb = self._bufs[seq_id][layer]
+        except KeyError as exc:
+            raise KeyError(f"no device KV for seq {seq_id} layer {layer}") from exc
         return kb.copy_host(), vb.copy_host()
 
     def free(self, seq_id: int) -> None:

@@ -35,7 +35,10 @@ def load_merges(path: str) -> list:
                 continue
             if not line.strip():
                 continue
-            a, b = line.split(" ")
+            parts = line.split(" ")
+            if len(parts) != 2:
+                raise ValueError(f"bad merges.txt line in {path}: {line!r}")
+            a, b = parts
             merges.append((a, b))
     return merges
 
@@ -95,6 +98,7 @@ class Tokenizer:
         self.special_ids = {
             s: self.bpe.vocab[s] for s in self.special_strings if s in self.bpe.vocab
         }
+        self._id_to_special = {v: k for k, v in self.special_ids.items()}
 
     @property
     def eos_token(self):
@@ -133,7 +137,23 @@ class Tokenizer:
         return ids
 
     def decode(self, ids) -> str:
-        return self.bpe.decode(ids)
+        """Decode ids to text, emitting special-token id sequences as their
+        literal strings (byte-level BPE would otherwise byte-decode the
+        added-token chars into garbage)."""
+        out = []
+        cur = []
+        for i in ids:
+            special = self._id_to_special.get(int(i))
+            if special is not None:
+                if cur:
+                    out.append(self.bpe.decode(cur))
+                    cur = []
+                out.append(special)
+            else:
+                cur.append(int(i))
+        if cur:
+            out.append(self.bpe.decode(cur))
+        return "".join(out)
 
     def token_to_id(self, token: str) -> int | None:
         return self.bpe.vocab.get(token)
@@ -147,17 +167,24 @@ class Tokenizer:
         template = self.config.get("chat_template")
         if not template:
             raise RuntimeError("this tokenizer has no chat_template in tokenizer_config.json")
-        import jinja2
+        import jinja2.sandbox
 
-        env = jinja2.Environment()
-        render = env.from_string(template)
-        kwargs = {
-            "messages": messages,
-            "add_generation_prompt": add_generation_prompt,
-            "bos_token": self.config.get("bos_token"),
-            "eos_token": self.config.get("eos_token"),
-            "add_special_tokens": True,
-            "echo": False,
-        }
-        rendered = render.render(**kwargs)
-        return rendered
+        # sandboxed: the template comes from a (semi-trusted) checkpoint dir;
+        # compiled once per template string (per-request recompilation is waste)
+        env = getattr(self, "_jenv", None)
+        if env is None:
+            env = self._jenv = jinja2.sandbox.ImmutableSandboxedEnvironment()
+        cache = getattr(self, "_jtmpl", None)
+        if cache is None:
+            cache = self._jtmpl = {}
+        render = cache.get(template)
+        if render is None:
+            render = cache[template] = env.from_string(template)
+        return render.render(
+            messages=messages,
+            add_generation_prompt=add_generation_prompt,
+            bos_token=self.config.get("bos_token"),
+            eos_token=self.config.get("eos_token"),
+            add_special_tokens=True,
+            echo=False,
+        )

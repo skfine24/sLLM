@@ -323,3 +323,215 @@ class Qwen4ExpSharding:
                 pos[r] += se - sb
             base += size
         return out
+
+
+class DeepseekV4Sharding:
+    """Name-driven TP2 plan for the DeepSeek-V4 checkpoint namespace (flat
+    names: `embed.weight`, `layers.N.attn.*`, `mtp.*`, ...), mirroring the
+    reference model.py TP semantics:
+
+    - q/wq_b/wo_a + embed/head + indexer.wq_b/weights_proj: COLUMN parallel
+      (split output rows) at head/group/vocab granularity;
+    - wo_b: ROW parallel (split input cols) at group-lora granularity;
+    - wkv, q_norm/kv_norm, compressor.*, hc_*, ffn.gate, shared experts,
+      norms: REPLICATED (plain Linear/RMSNorm in the reference);
+    - routed experts (w1/w3/w2 + their E8M0 scale): partition by expert;
+    - fmt: fp8 (E4M3+E8M0, 128x128 blocks) or fp4 (packed E2M1 + per-row 32-col
+      E8M0). Scales shard with weights; the 128-unit block rule of
+      `validate_tensor` applies to fp8 splits (all DeepSeek split sizes are
+      ert 128-aligned: 512/1024/4096/64640...).
+    """
+
+    def __init__(self, cfg, tp: int = 2, block: int = 128,
+                 fp4_block_w: int = 32):
+        if tp <= 1:
+            raise ShardError("tp must be > 1")
+        self.cfg, self.tp, self.block = cfg, tp, block
+        self.fp4_block_w = fp4_block_w
+        for what, n in (("n_heads", cfg.n_heads), ("n_groups", cfg.o_groups),
+                        ("index_n_heads", cfg.index_n_heads),
+                        ("n_experts", cfg.n_routed_experts)):
+            if n % tp:
+                raise ShardError(f"{what}={n} not divisible by tp={tp}")
+
+    _RE = {
+        "embed": re.compile(r"^embed\.weight$"),
+        "head": re.compile(r"^head\.weight$"),
+        "wq_a": re.compile(r"^layers\.\d+\.attn\.wq_a\.weight$"),
+        "wq_b": re.compile(r"^layers\.\d+\.attn\.wq_b\.weight$"),
+        "wo_a": re.compile(r"^layers\.\d+\.attn\.wo_a\.weight$"),
+        "wo_b": re.compile(r"^layers\.\d+\.attn\.wo_b\.weight$"),
+        "idx_wq_b": re.compile(
+            r"^layers\.\d+\.attn\.indexer\.wq_b\.weight$"),
+        "idx_wproj": re.compile(
+            r"^layers\.\d+\.attn\.indexer\.weights_proj\.weight$"),
+        "expert": re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.w[123]\.weight$"),
+        "mtp_wq_b": re.compile(r"^mtp\.\d+\.attn\.wq_b\.weight$"),
+        "mtp_wo_a": re.compile(r"^mtp\.\d+\.attn\.wo_a\.weight$"),
+        "mtp_wo_b": re.compile(r"^mtp\.\d+\.attn\.wo_b\.weight$"),
+        "markov_w1": re.compile(r"^mtp\.\d+\.markov_head\.markov_w1\.weight$"),
+        "markov_w2": re.compile(r"^mtp\.\d+\.markov_head\.markov_w2\.weight$"),
+    }
+
+    def plan_for(self, name: str) -> TensorPlan:
+        c = self.cfg
+        R = self._RE
+        if R["embed"].match(name) or R["head"].match(name):
+            return TensorPlan(_OUT, ((None, 1),))       # vocab-row split
+        if R["wq_a"].match(name):
+            return TensorPlan(_OUT, ((c.q_lora_rank, 1),))
+        if R["wq_b"].match(name):
+            return TensorPlan(_OUT, ((c.n_heads * c.head_dim, c.head_dim),))
+        if R["wo_a"].match(name):
+            return TensorPlan(_OUT, ((c.o_groups * c.o_lora_rank,
+                                      c.o_lora_rank),))
+        if R["wo_b"].match(name):
+            return TensorPlan(_IN, ((c.o_groups * c.o_lora_rank,
+                                     c.o_lora_rank),))
+        if R["idx_wq_b"].match(name):
+            return TensorPlan(_OUT, ((c.index_n_heads * c.index_head_dim,
+                                      c.index_head_dim),))
+        if R["idx_wproj"].match(name):
+            return TensorPlan(_OUT, ((c.index_n_heads, 1),))
+        if R["mtp_wq_b"].match(name):
+            return TensorPlan(_OUT, ((c.n_heads * c.head_dim, c.head_dim),))
+        if R["mtp_wo_a"].match(name):
+            return TensorPlan(_OUT, ((c.o_groups * c.o_lora_rank,
+                                      c.o_lora_rank),))
+        if R["mtp_wo_b"].match(name):
+            return TensorPlan(_IN, ((c.o_groups * c.o_lora_rank,
+                                     c.o_lora_rank),))
+        if R["markov_w1"].match(name) or R["markov_w2"].match(name):
+            return TensorPlan(_OUT, ((None, 1),))       # vocab-row split
+        m = R["expert"].match(name)
+        if m:
+            return TensorPlan(_EXPERTS, expert=int(m.group(1)))
+        # everything else (wkv, norms, compressor, indexer.compressor, hc_*,
+        # ffn.gate, shared experts, attn_sink, ape, hc_head/markov-head proj
+        # internals, main_proj/main_norm): replicate (reference plain Linear).
+        return TensorPlan(_REP)
+
+    # -- ranges / slicing / reassembly reuse the qwen4 implementation ---------
+
+    def segment_ranges(self, size, unit):
+        per = size // self.tp
+        if size % self.tp:
+            raise ShardError(f"segment size {size} not divisible by tp={self.tp}")
+        if per % unit:
+            raise ShardError(
+                f"segment {size} (unit {unit}) splits into misaligned "
+                f"{per}-slices for tp={self.tp}")
+        return [(r * per, (r + 1) * per) for r in range(self.tp)]
+
+    def rank_row_ranges(self, plan):
+        out = []
+        for r in range(self.tp):
+            rr, base = [], 0
+            for size, unit in plan.segments:
+                if size is None:
+                    raise ShardError("dynamic-size plan needs tensor shape")
+                b, e = self.segment_ranges(size, unit)[r]
+                rr.append((base + b, base + e))
+                base += size
+            out.append(rr)
+        return out
+
+    def _col_ranges(self, plan):
+        size, unit = plan.segments[0]
+        rng = self.segment_ranges(size, unit)
+        return [[rng[r]] for r in range(self.tp)]
+
+    def rank_ranges(self, name: str, shape: tuple):
+        plan = self.plan_for(name)
+        if plan.kind == _OUT:
+            if plan.segments[0][0] is None:
+                if shape[0] % self.tp:
+                    raise ShardError(f"vocab {shape[0]} not divisible by tp")
+                per = shape[0] // self.tp
+                return [[(r * per, (r + 1) * per)] for r in range(self.tp)]
+            total = sum(s for s, _ in plan.segments)
+            if total != shape[0]:
+                raise ShardError(f"plan expects out-dim {total}, got {shape[0]}")
+            return self.rank_row_ranges(plan)
+        if plan.kind == _IN:
+            if plan.segments[0][0] != shape[1]:
+                raise ShardError(f"plan expects in-dim {plan.segments[0][0]}, "
+                                 f"got {shape[1]}")
+            return self._col_ranges(plan)
+        raise ShardError(f"no ranges for kind {plan.kind}")
+
+    def validate_tensor(self, name: str, shape: tuple,
+                        quantized: bool = True) -> None:
+        plan = self.plan_for(name)
+        if plan.kind in (_REP, _EXPERTS):
+            return
+        axis = 0 if plan.kind == _OUT else 1
+        for rr in self.rank_ranges(name, shape):
+            for b, e in rr:
+                if e <= b:
+                    raise ShardError(f"empty rank slice for {name}")
+                if quantized:
+                    bl0, bl1 = b // self.block, (e - 1) // self.block
+                    if b % self.block and bl1 != bl0:
+                        raise ShardError(
+                            f"{name}: rank slice [{b},{e}) on axis {axis} cuts "
+                            f"block {bl0} without staying inside it "
+                            "(fp8 scale would be ambiguous)")
+
+    def owner(self, expert: int) -> int:
+        per = self.cfg.n_routed_experts // self.tp
+        return min(expert // per, self.tp - 1)
+
+    def shard(self, name: str, arr):
+        plan = self.plan_for(name)
+        arr = np.asarray(arr)
+        if plan.kind == _REP:
+            return [arr] * self.tp
+        if plan.kind == _EXPERTS:
+            return [arr if self.owner(plan.expert) == r else None
+                    for r in range(self.tp)]
+        axis = 0 if plan.kind == _OUT else 1
+        return [np.concatenate(
+            [(sl[b:e] if axis == 0 else sl[:, b:e]) for b, e in rr], axis=axis)
+            for rr in self.rank_ranges(name, arr.shape)
+            for sl in [arr]]
+
+    def shard_scale(self, name: str, scale):
+        """Rank slices of the E8M0 (128x128) scale grid, matching `shard()`.
+        fp4 experts are EXPERTS-planned (no scale slicing here); their
+        per-row-32-col scales stay whole with the owned expert tensors."""
+        plan = self.plan_for(name)
+        scale = np.asarray(scale)
+        if plan.kind == _REP:
+            return [scale] * self.tp
+        if plan.kind == _EXPERTS:
+            raise ShardError("expert tensors are plan-whole; scale slicing is "
+                             "not needed (per-rank dequant uses the full pair)")
+        blk = self.block
+        if plan.kind == _OUT:
+            return [np.concatenate([scale[b // blk: int(np.ceil(e / blk))]
+                                    for b, e in rr], axis=0)
+                    for rr in self.rank_row_ranges(plan)]
+        return [np.concatenate([scale[:, b // blk: int(np.ceil(e / blk))]
+                                for b, e in rr], axis=1)
+                for rr in self._col_ranges(plan)]
+
+    def shard_pair(self, name, fp8, scale):
+        w = self.shard(name, fp8)
+        s = self.shard_scale(name, scale)
+        return [(w[r], None if w[r] is None else s[r]) for r in range(self.tp)]
+
+    def full_from_shards(self, name, shards):
+        plan = self.plan_for(name)
+        if plan.kind == _REP:
+            return shards[0]
+        if plan.kind == _EXPERTS:
+            raise ShardError("expert tensors reassemble by expert index")
+        axis = 0 if plan.kind == _OUT else 1
+        if plan.kind == _OUT and plan.segments[0][0] is None:
+            axis = 0
+        return np.concatenate(shards, axis=axis)
+
+    def full_scale_from_shards(self, name, shards):
+        return np.concatenate(shards, axis=0 if self.plan_for(name).kind == _OUT
+                              else 1)

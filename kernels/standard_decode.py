@@ -36,11 +36,18 @@ def gpu_standard_decode_step(cache, weights, recipe, last_id: int) -> np.ndarray
     n_rep = nh // kvh
 
     embed_w = weights[f"{prefix}.embed_tokens.weight"]
+    if last_id < 0:
+        raise ValueError(f"negative token id {last_id}")
     hidden = embed_w[[last_id]].astype(np.float32)
 
     pos = cache.n_ctx
-    cache.n_ctx += 1
     cos, sin = inc._pos_cos_sin(theta, cache.rot, pos)
+
+    # KV appends are STAGED, not written: a failure at any layer must leave
+    # the host cache exactly as the numpy fallback expects (the executor
+    # degrades to numpy after a failed step).
+    new_k: dict[int, np.ndarray] = {}
+    new_v: dict[int, np.ndarray] = {}
 
     for i in range(recipe.num_layers):
         p = f"{prefix}.layers.{i}"
@@ -58,9 +65,9 @@ def gpu_standard_decode_step(cache, weights, recipe, last_id: int) -> np.ndarray
         k = _proj(h_in, wk, kb).reshape(1, kvh, 1, hd)
         v = _proj(h_in, wv, vb).reshape(1, kvh, 1, hd)
         q, k = qq.apply_rotary_pos_emb(q, k, cos[None, None], sin[None, None])
-        cache.k[i] = np.concatenate([cache.k[i], k[0]], axis=1)
-        cache.v[i] = np.concatenate([cache.v[i], v[0]], axis=1)
-        kt, vt = inc._replicate(cache.k[i], cache.v[i], n_rep)
+        new_k[i] = np.concatenate([cache.k[i], k[0]], axis=1)
+        new_v[i] = np.concatenate([cache.v[i], v[0]], axis=1)
+        kt, vt = inc._replicate(new_k[i], new_v[i], n_rep)
         attn = ck.attention_decode(q[0, :, 0, :], kt, vt, hd ** -0.5)
         attn = attn.reshape(1, nh * hd)
         hidden = ck.elwise_add(residual, _proj(attn, wo))
@@ -73,6 +80,12 @@ def gpu_standard_decode_step(cache, weights, recipe, last_id: int) -> np.ndarray
         hidden = ck.elwise_add(residual, hl)
 
     hidden = st.rms_norm_plain(hidden, weights[f"{prefix}.norm.weight"], eps=eps)
-    if recipe.tie_word_embeddings:
-        return _proj(hidden, embed_w)[0]
-    return _proj(hidden, weights["lm_head.weight"])[0]
+    out = (_proj(hidden, embed_w) if recipe.tie_word_embeddings
+           else _proj(hidden, weights["lm_head.weight"]))[0]
+
+    # commit: the step fully succeeded
+    for i in range(recipe.num_layers):
+        cache.k[i] = new_k[i]
+        cache.v[i] = new_v[i]
+    cache.n_ctx += 1
+    return out

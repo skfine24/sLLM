@@ -75,11 +75,91 @@ class TestQwen4ExpPipeline(unittest.TestCase):
             self.assertEqual(st.layers[i]["conv_win"].shape[2],
                              self.cfg.lin_conv - 1)
 
-    def test_ple_guard(self):
-        cfg = tiny_qwen4_exp_cfg()
-        cfg.ple_layer_ids = (2,)
-        with self.assertRaises(NotImplementedError):
-            qp.prefill(self.ids, self.w, cfg)
+    def test_ple_prefill_decode_parity(self):
+        from serving.dev_model import tiny_qwen4_exp_ple_cfg
+        cfg = tiny_qwen4_exp_ple_cfg()
+        w = tiny_qwen4_exp_weights(cfg)
+        ids = [3, 11, 1, 7, 12, 3]
+        state, logits = qp.prefill(ids, w, cfg)
+        want = logits[-1]
+        st2 = qp.Qwen4ExpState(cfg)
+        got = None
+        for tid in ids:
+            got = qp.decode_step(st2, w, cfg, tid)
+        self.assertEqual(st2.n_ctx, state.n_ctx)
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=2e-4)
+        self.assertEqual(int(np.argmax(got)), int(np.argmax(want)))
+
+    def test_ple_changes_logits(self):
+        from serving.dev_model import tiny_qwen4_exp_ple_cfg
+        ple_cfg = tiny_qwen4_exp_ple_cfg()
+        # same seed ⇒ w_ple main tensors == base weights + PLE extras
+        w_ple = tiny_qwen4_exp_weights(ple_cfg)
+        _, lg_ple = qp.prefill([3, 11, 1, 7], w_ple, ple_cfg)
+        base_cfg = tiny_qwen4_exp_cfg()
+        # main tensors only (no PLE tensors)
+        main = {k: v for k, v in w_ple.items() if ".ple." not in k}
+        _, lg_base = qp.prefill([3, 11, 1, 7], main, base_cfg)
+        self.assertFalse(np.allclose(lg_ple, lg_base, atol=0.0),
+                         "PLE must change the hyper stream / logits")
+
+    def test_ple_incremental_batched_same_as_sequential(self):
+        from serving.dev_model import tiny_qwen4_exp_ple_cfg
+        cfg = tiny_qwen4_exp_ple_cfg()
+        w = tiny_qwen4_exp_weights(cfg)
+        ids = [3, 11, 8, 12]
+        _, _, hyper_d = qp.prefill(ids, w, cfg, return_hyper=True)
+        self.assertEqual(hyper_d.shape[1], len(ids))
+        stb = qp.Qwen4ExpState(cfg)
+        _, lg_batch = qp._forward(stb, w, cfg, hyper_in=hyper_d,
+                                  ple_input_ids=np.array([ids]))
+        sts = qp.Qwen4ExpState(cfg)
+        lg_seq = []
+        for p in range(len(ids)):
+            _, lg_p = qp._forward(sts, w, cfg, hyper_in=hyper_d[:, p:p + 1],
+                                  ple_input_ids=np.array([[ids[p]]]))
+            lg_seq.append(lg_p[0])
+        np.testing.assert_allclose(lg_batch, np.stack(lg_seq), rtol=0, atol=1e-4)
+        self.assertEqual(stb.n_ctx, sts.n_ctx)
+
+    def test_batched_hyper_injection_matches_sequential(self):
+        import copy
+        draft_ids = [3, 11, 2, 8]
+        # the fused draft input: pre-final hyper tensor (1, S, hc*H) for the
+        # draft positions, exactly what the MTP path feeds to `_forward`
+        _, _, hyper_d = qp.prefill(draft_ids, self.w, self.cfg,
+                                   return_hyper=True)
+        self.assertEqual(hyper_d.shape[1], len(draft_ids))
+
+        # batched draft-extend: one fused call with all S positions
+        stb = qp.Qwen4ExpState(self.cfg)
+        _, lg_batch, hyper_out = qp._forward(stb, self.w, self.cfg,
+                                             hyper_in=hyper_d, return_hyper=True)
+
+        # sequential reference: S single-token hyper-injections
+        sts = qp.Qwen4ExpState(self.cfg)
+        lg_seq = []
+        for p in range(hyper_d.shape[1]):
+            _, lg_p = qp._forward(sts, self.w, self.cfg,
+                                  hyper_in=hyper_d[:, p:p + 1])
+            lg_seq.append(lg_p[0])
+        lg_seq = np.stack(lg_seq, axis=0)
+
+        self.assertEqual(stb.n_ctx, sts.n_ctx)
+        np.testing.assert_allclose(lg_batch, lg_seq, rtol=0, atol=1e-6)
+        # identical cache growth per layer type
+        for i, bt in enumerate(self.cfg.layer_types):
+            if bt == "linear_attention":
+                for key in ("gdn", "conv_win"):
+                    self.assertEqual(stb.layers[i][key].shape,
+                                     sts.layers[i][key].shape)
+            else:
+                for key in ("k", "v", "tok_k", "ck"):
+                    self.assertEqual(stb.layers[i][key].shape,
+                                     sts.layers[i][key].shape)
+        # argmax agreement on the final draft position
+        self.assertEqual(int(np.argmax(lg_batch[-1])),
+                         int(np.argmax(lg_seq[-1])))
 
 
 if __name__ == "__main__":

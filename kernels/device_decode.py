@@ -65,65 +65,68 @@ class DeviceWeightTable:
         self.elem = 2 if dtype == "bf16" else 4
         prefix = recipe.text_prefix
         self._bufs: dict[str, ck.DeviceBuffer] = {}
-        sizes = 0
 
-        def up(arr) -> ck.DeviceBuffer:
-            """Upload a weight matrix in the table dtype."""
-            nonlocal sizes
-            a = _f32(arr)
-            sizes += a.nbytes // 2 if self.elem == 2 else a.nbytes
-            if self.elem == 4:
-                return ck.to_device(a)
-            buf = ck.alloc_n(a.nbytes // 2)
-            buf.upload_raw(ck.to_bf16(a))
-            return buf
+        # -- plan FIRST ------------------------------------------------------
+        # The free-memory guard must run BEFORE any cudaMalloc: an
+        # upload-then-check order can already have OOMed / hung the node.
+        plan: list[tuple[str, list, bool]] = []  # (key, source arrays, fp32?)
 
-        def up32(arr) -> ck.DeviceBuffer:
-            """Upload a norm/bias vector (always fp32)."""
-            nonlocal sizes
-            a = _f32(arr)
-            sizes += a.nbytes
-            return ck.to_device(a)
+        def add(key: str, *arrs, is32: bool = False) -> None:
+            plan.append((key, list(arrs), is32))
 
-        embed = weights[f"{prefix}.embed_tokens.weight"]
-        self.embed = up(embed)
-        self.head = self.embed if recipe.tie_word_embeddings \
-            else up(weights["lm_head.weight"])
-        self.final_norm = up32(weights[f"{prefix}.norm.weight"])
-        self._bufs["__embed__"] = self.embed
-        if self.head is not self.embed:
-            self._bufs["__head__"] = self.head
-        self._bufs["__final_norm__"] = self.final_norm
-
+        tied = recipe.tie_word_embeddings
+        add("__embed__", weights[f"{prefix}.embed_tokens.weight"])
+        if not tied:
+            add("__head__", weights["lm_head.weight"])
+        add("__final_norm__", weights[f"{prefix}.norm.weight"], is32=True)
         for i in range(recipe.num_layers):
             p = f"{prefix}.layers.{i}"
-            wq = weights[f"{p}.self_attn.q_proj.weight"]
-            wk = weights[f"{p}.self_attn.k_proj.weight"]
-            wv = weights[f"{p}.self_attn.v_proj.weight"]
-            self._bufs[f"{p}.qkv_w"] = up(
-                np.concatenate([_f32(wq), _f32(wk), _f32(wv)], axis=0))
+            add(f"{p}.qkv_w",
+                weights[f"{p}.self_attn.q_proj.weight"],
+                weights[f"{p}.self_attn.k_proj.weight"],
+                weights[f"{p}.self_attn.v_proj.weight"])
             for leaf in ("q_proj", "k_proj", "v_proj"):
                 b = weights.get(f"{p}.self_attn.{leaf}.bias")
                 if b is not None:
-                    self._bufs[f"{p}.self_attn.{leaf}.bias"] = up32(b)
-            self._bufs[f"{p}.o_proj"] = up(weights[f"{p}.self_attn.o_proj.weight"])
-            wg = weights[f"{p}.mlp.gate_proj.weight"]
-            wu = weights[f"{p}.mlp.up_proj.weight"]
-            self._bufs[f"{p}.gu_w"] = up(
-                np.concatenate([_f32(wg), _f32(wu)], axis=0))
-            self._bufs[f"{p}.down_proj"] = up(weights[f"{p}.mlp.down_proj.weight"])
-            self._bufs[f"{p}.in_ln"] = up32(weights[f"{p}.input_layernorm.weight"])
-            self._bufs[f"{p}.post_ln"] = up32(
-                weights[f"{p}.post_attention_layernorm.weight"])
+                    add(f"{p}.self_attn.{leaf}.bias", b, is32=True)
+            add(f"{p}.o_proj", weights[f"{p}.self_attn.o_proj.weight"])
+            add(f"{p}.gu_w",
+                weights[f"{p}.mlp.gate_proj.weight"],
+                weights[f"{p}.mlp.up_proj.weight"])
+            add(f"{p}.down_proj", weights[f"{p}.mlp.down_proj.weight"])
+            add(f"{p}.in_ln", weights[f"{p}.input_layernorm.weight"], is32=True)
+            add(f"{p}.post_ln", weights[f"{p}.post_attention_layernorm.weight"],
+                is32=True)
 
+        sizes = sum(sum(a.size for a in arrs) * (4 if is32 else self.elem)
+                    for _k, arrs, is32 in plan)
         free = ck.mem_free_bytes()
-        if 0 <= free < sizes + slack_bytes:
-            for buf in list(self._bufs.values()):
-                buf.free()
-            self._bufs.clear()
+        if free < 0:
+            # GB10 over-subscription can hang the node until power-off: an
+            # unknown free-memory figure is treated as unsafe, not as "skip
+            # the check".
+            raise RuntimeError(
+                "cannot query free device memory (cudaMemGetInfo failed); "
+                "refusing the device-resident upload (GB10 guard)")
+        if free < sizes + slack_bytes:
             raise RuntimeError(
                 f"insufficient free device memory for resident weights: "
                 f"{free} B free < {sizes} B weights + {slack_bytes} B slack")
+
+        # -- upload ----------------------------------------------------------
+        for key, arrs, is32 in plan:
+            a = _f32(arrs[0] if len(arrs) == 1
+                     else np.concatenate([_f32(x) for x in arrs], axis=0))
+            if is32 or self.elem == 4:
+                self._bufs[key] = ck.to_device(a)
+            else:
+                buf = ck.alloc_n(a.nbytes // 2)
+                buf.upload_raw(ck.to_bf16(a))
+                self._bufs[key] = buf
+
+        self.embed = self._bufs["__embed__"]
+        self.head = self.embed if tied else self._bufs["__head__"]
+        self.final_norm = self._bufs["__final_norm__"]
         self.total_bytes = sizes
 
     def get(self, key: str):
@@ -219,13 +222,42 @@ class DeviceDecodeState:
         blk_words = self.hd * self.elem // 4
         if self.hd * self.elem % 4:
             raise ValueError("head row not word-aligned")
+        # exception-safe: allocate ALL new buffers first (a failure leaves the
+        # old KV + self.cap untouched -> no mixed-stride state), relayout,
+        # and only then free the old buffers.
+        fresh: list[ck.DeviceBuffer] = []
+        try:
+            for _store in (self._k, self._v):
+                for _i in _store:
+                    fresh.append(ck.alloc_n(nb))
+        except BaseException:
+            for buf in fresh:
+                try:
+                    buf.free()
+                except Exception:
+                    pass
+            raise
+        new_k: dict[int, ck.DeviceBuffer] = {}
+        new_v: dict[int, ck.DeviceBuffer] = {}
+        it = iter(fresh)
+        try:
+            for store, new_store in ((self._k, new_k), (self._v, new_v)):
+                for i, buf in store.items():
+                    new = next(it)
+                    ck.kv_relayout_w(new, buf, self.kvh, self.cap, cap_new,
+                                     blk_words)
+                    new_store[i] = new
+        except BaseException:
+            for buf in fresh:
+                try:
+                    buf.free()
+                except Exception:
+                    pass
+            raise
         for store in (self._k, self._v):
-            for i, buf in store.items():
-                new = ck.alloc_n(nb)
-                ck.kv_relayout_w(new, buf, self.kvh, self.cap, cap_new,
-                                 blk_words)
+            for buf in store.values():
                 buf.free()
-                store[i] = new
+        self._k, self._v = new_k, new_v
         self.cap = cap_new
         self._scores.free()
         self._scores = ck.alloc(self.nh * cap_new)
@@ -237,9 +269,17 @@ class DeviceDecodeState:
 
         cache, table, p0 = self.cache, self.table, self.recipe.text_prefix
         t = self.t
+        last_id = int(last_id)
+        if not 0 <= last_id < self.V:
+            raise ValueError(f"token id {last_id} outside vocab [0, {self.V})")
         pos = cache.n_ctx
+        max_pos = int(self.recipe.max_position_embeddings)
+        if pos >= max_pos:
+            raise RuntimeError(
+                f"decode position {pos} reached max_position_embeddings "
+                f"({max_pos})")
         if pos >= self.cap:
-            self._grow(max(2 * self.cap, pos + 1))
+            self._grow(min(max(2 * self.cap, pos + 1), max_pos))
 
         cos, sin = inc._pos_cos_sin(self.theta, self.rot, pos)
         self._cs.upload(np.concatenate([cos, sin]))

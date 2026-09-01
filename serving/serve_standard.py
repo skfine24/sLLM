@@ -17,6 +17,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from loaders.weights import load_recipe_weights  # noqa: E402
 from recipes.schema import Recipe  # noqa: E402
+from env_config import get as _env  # noqa: E402
+from env_config import get_int as _env_int  # noqa: E402
+from serving import diag  # noqa: E402
 from serving.executor import InferenceEngine, ReferenceModel  # noqa: E402
 from serving.tokenizer import Tokenizer  # noqa: E402
 
@@ -41,7 +44,10 @@ def main(argv=None):
     ap.add_argument("--batch", nargs="+", default=None,
                     help="several prompts served with continuous batching (BatchedInferenceEngine)")
     ap.add_argument("--max-new", type=int, default=16)
-    ap.add_argument("--port", type=int, default=8002)
+    ap.add_argument("--host", default=None,
+                    help="bind address (default $SLLM_HOST / 0.0.0.0)")
+    ap.add_argument("--port", type=int, default=None,
+                    help="bind port (default $SLLM_PORT / 8002)")
     ap.add_argument("--kv-placement", choices=["device", "host"], default=None,
                     help="override the recipe memory.kv_placement (device|host)")
     ap.add_argument("--use-gpu", action="store_true",
@@ -62,13 +68,19 @@ def main(argv=None):
         recipe.memory.kv_placement = args.kv_placement
     from runtime.placement import KVMemoryPlan
     plan = KVMemoryPlan.from_recipe(recipe)
-    print(f"[serve-standard] {recipe.model_id} kv_placement={plan.placement} "
-          f"plan={plan.describe()} (CPU mode uses host RAM only)")
+    engine.show_banner(tag="serve-standard")
+    diag.info("serve-standard", f"{recipe.model_id} kv_placement="
+                               f"{plan.placement} plan={plan.describe()} "
+                               f"(CPU mode uses host RAM only)")
 
     if args.serve:
         from serving.server import create_server
-        server, port = create_server(engine, host="0.0.0.0", port=args.port, quiet=False)
-        print(f"[serve-standard] {recipe.model_id} on http://0.0.0.0:{port}")
+        host = args.host or _env("SLLM_HOST") or "0.0.0.0"
+        port = args.port or _env_int("SLLM_PORT", 8002)
+        server, port = create_server(engine, host=host, port=port,
+                                     quiet=False)
+        diag.info("serve-standard", f"{recipe.model_id} on "
+                                    f"http://{host}:{port}")
         try:
             server.serve_forever()
         except KeyboardInterrupt:

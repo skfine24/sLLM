@@ -12,7 +12,12 @@ Scope (milestone Q1 of docs/design/09-roadmap-seq-qwen4exp-dsv4.md):
   pooling, fast top-k, block->token expansion, sparse attention reference
 - indexer q/k projection (GemmaRMSNorm + partial neox rotary, head_dim 128)
 
-Out of scope here (later milestones): PLE/ngram, MTP-hybrid, vision, TP.
+Later milestones that now EXIST elsewhere (this file stays component-level):
+- PLE/ngram oracle -> `ref/qwen4_exp_ple.py` (wired into the pipeline
+  `ref/qwen4_exp_pipeline.py`)
+- MTP-hybrid fusion/draft -> `ref/qwen4_exp_mtp.py` + runtime/spec.py
+Still out of scope: vision (VP170 tower, same arch as the DSV4 SigLIP), TP,
+fp8 loading.
 Tie-breaking note: `torch.topk` does not guarantee tie order; this oracle
 uses stable sort (ties keep ascending index order). Measured tests use
 random data without exact ties.
