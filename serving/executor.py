@@ -215,8 +215,13 @@ class ReferenceModel:
                     and not self._resident_off):
                 try:
                     return self._resident_step(cache, last_id)
-                except Exception:  # noqa: BLE001 - host cache untouched, degrade
-                    pass
+                except Exception as _e:  # noqa: BLE001 - degrade, never fail
+                    # surface WHY the fast path was skipped (free-memory
+                    # guard / missing symbol / CUDA OOM) instead of a silent
+                    # drop to the slower transfer kernels
+                    diag.warn("sllm", f"device-resident decode skipped "
+                                      f"({type(_e).__name__}: {_e}); using "
+                                      f"per-step transfer kernels")
             try:
                 if self.recipe.full_attention.kernel == "standard_gqa":
                     from kernels.standard_decode import gpu_standard_decode_step
