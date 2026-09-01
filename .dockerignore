@@ -1,12 +1,30 @@
-# Build context is the repo root (docker build -f deploy/Dockerfile .).
-# Keep the image clean: caches, host-built kernel artifacts, VCS, vendored
-# upstream reference code (not needed at runtime).
+# .dockerignore -- keep dev/validation/audit resources OUT of the image build
+# context (the deployment image ships runtime code only).
+#
+# Anything listed here is also never COPYed by deploy/Dockerfile (which does
+# an explicit runtime-only COPY list on top, so exclusion holds even if this
+# file is missing at build time).
+
 .git
-**/__pycache__/
-**/*.py[cod]
-kernels/cuda/*.o
-kernels/cuda/*.so
-kernels/cuda/*.cubin
-oracle/upstream/
-*.npz
-*.log
+.gitignore
+tests
+bench
+oracle
+demo
+docs
+log.md
+ref/hf_sources
+serving/cli.py
+serving/dev_model.py
+
+# python/build noise
+*.pyc
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# local scratch / editor
+*.bak
+*.orig

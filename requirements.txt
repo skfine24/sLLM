@@ -1,0 +1,11 @@
+# sLLM RUNTIME dependencies (deployment, VERSION-PINNED for reproducible images).
+#
+# Verified on the dev box (python 3.12, aarch64++) and installed into the
+# sllm-node image by build.sh (deploy/Dockerfile pins the same set).
+#
+# Dev/validation-only packages (ml_dtypes, tokenizers, torch, transformers,
+# pytest) are INTENTIONALLY not shipped in the deployment image.
+numpy==2.2.6
+PyYAML==6.0.3
+Jinja2==3.1.6
+regex==2026.7.19
