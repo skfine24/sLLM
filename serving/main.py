@@ -35,6 +35,8 @@ from __future__ import annotations
 import argparse
 import os
 
+import numpy as np
+
 from env_config import get as _env
 from env_config import get_int as _env_int
 from recipes.schema import Recipe
