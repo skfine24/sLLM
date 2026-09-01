@@ -103,6 +103,11 @@ if [[ "$CPU" == 1 ]]; then
 elif [[ -n "${SLLM_USE_GPU:-}" ]]; then
   RUN+=(-e "SLLM_USE_GPU=$SLLM_USE_GPU")
 fi
+# resident decode dtype (fp32|bf16) -- halves resident weights, lets
+# device-resident decode fit on a shared GB10 GPU
+if [[ -n "${SLLM_GPU_DTYPE:-}" ]]; then
+  RUN+=(-e "SLLM_GPU_DTYPE=$SLLM_GPU_DTYPE")
+fi
 # weights directory (recipe paths.local_dir): mounted at the SAME path, and
 # always passed as --model-dir so the container never expands a stray ~
 MDIR="${MDIR:-$R_MDIR}"
