@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import threading
+import time
 import unittest
 
 from serving import diag
@@ -152,12 +153,20 @@ class TestHttpLines(unittest.TestCase):
                                "max_tokens": 2})
             # diag.capture() is thread-safe: the handler thread writes into
             # the same buffer even though it outlives this caller's frame.
+            # The [http] line is emitted in the handler's finally (AFTER the
+            # body is written), so poll for it while still inside the capture
+            # instead of racing the client's read-unblock.
             with diag.capture() as buf:
                 conn.request("POST", "/v1/chat/completions", body,
                              {"Content-Type": "application/json"})
                 resp = conn.getresponse()
                 resp.read()
-            conn.close()
+                conn.close()
+                deadline = time.monotonic() + 2.0
+                marker = f"POST /v1/chat/completions -> {resp.status}"
+                while (marker not in buf.getvalue()
+                       and time.monotonic() < deadline):
+                    time.sleep(0.01)
         finally:
             server.shutdown()
             server.server_close()
