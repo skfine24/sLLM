@@ -1,283 +1,126 @@
 # sLLM
 
-sLLM is a from-scratch **model serving engine for dual-node NVIDIA DGX Spark
-(GB10)** that serves several models, one at a time, under a single engine. It
-exposes an OpenAI-compatible HTTP API (chat / completions, SSE streaming) and
-a small CLI, with a recipe-driven configuration model.
+sLLM은 듀얼노드 NVIDIA DGX Spark(GB10)를 위한 **자체 개발 모델 서빙 엔진**입니다.
+하나의 엔진으로 여러 모델을 하나씩 로드해 서빙하며, OpenAI 호환 HTTP API와 CLI를
+제공합니다.
 
-This README is the **user guide** — install, configure, run, and serve models.
-Design/implementation details live under [`docs/design/`](#design-documents).
-
----
-
-## 1. Supported models
-
-Each model has a **recipe** (`recipes/<Model>.yaml`) that describes the model
-identity, geometry, weight location and launch settings.
-
-| Recipe | Model | Architecture | Weights |
+| 레시피 | 모델 | 아키텍처 | 크기 |
 |---|---|---|---|
-| `Qwen3.8-27B-FP8.yaml` | Qwen/Qwen3.8-27B-FP8 | GDN linear-attention + dense MLP + MTP + vision | ~29 GiB |
-| `Qwen3.8-Flash-Next-FP8.yaml` | Qwen/Qwen3.8-Flash-Next-FP8 | GDN + QSA sparse + MoE + MTP + PLE/ngram | ~173 GiB |
-| `DeepSeek-V4-Flash-0731.yaml` | deepseek-ai/DeepSeek-V4-Flash-0731 | MLA + sparse + MoE (fp4) + DSPark spec decode | ~156 GiB |
-| `Qwen2.5-Coder-0.5B.yaml` | Qwen/Qwen2.5-Coder-0.5B | standard dense transformer | ~1 GiB |
-
-**Runnability today**
-
-- **Local (dev machine, no GPU / no checkpoint):** tiny reference engines —
-  `python -m serving.cli` and `python -m serving.server` (built-in weights).
-- **Real standard models:** Llama/Qwen2-family (e.g. `Qwen2.5-Coder-0.5B`) via
-  `serving/serve_standard.py`.
-- **Real qwen3_5 (Qwen3.8-27B-FP8):** the real-checkpoint engine branch is
-  wired (GDN linear-attn + paged full-attn, numpy incremental); needs a
-  **quiet GPU window** because `load_recipe_weights` de-quantizes fp8→fp32
-  (~58 GiB). Run with `--tp 1` on a single node.
-- **Real qwen4_exp / deepseek_v4 checkpoints:** cluster-gated (full fp8/fp4
-  GPU + TP2 milestones). Use `--mode plan` to see the run plan without a GPU.
+| `Qwen3.8-27B-FP8.yaml` | Qwen/Qwen3.8-27B-FP8 | GDN 하이브리드 + MTP | ~29 GiB |
+| `Qwen3.8-Flash-Next-FP8.yaml` | Qwen/Qwen3.8-Flash-Next-FP8 | GDN + QSA + MoE + PLE + MTP | ~173 GiB |
+| `DeepSeek-V4-Flash-0731.yaml` | deepseek-ai/DeepSeek-V4-Flash-0731 | MLA + sparse + MoE(fp4) + DSPark | ~156 GiB |
+| `Qwen2.5-Coder-0.5B.yaml` | Qwen/Qwen2.5-Coder-0.5B | 표준 dense transformer | ~1 GiB |
 
 ---
 
-## 2. Installation
+## 주요 기능
 
-Requirements: **Python 3.10+**, `numpy`, `pyyaml`, `regex`, `jinja2`.
-Docker is needed for the container launcher `sllm`; CUDA tooling (nvcc 13.0)
-is only needed on the cluster to build the GPU kernels.
+- **하나의 엔진, 여러 아키텍처** — `qwen3_5`(GDN), `qwen4_exp`(QSA/MoE/PLE/MTP),
+  `deepseek_v4`(MLA/HDC/fp4/DSPark), 표준 Llama/Qwen2 계열을 한 서빙 스택으로 처리
+- **OpenAI 호환 API** — `/v1/models`, `/v1/chat/completions`, `/v1/completions`,
+  `stream:true` SSE, 요청당 `usage` 통계
+- **GPU-AUTO 기본** — CUDA+`.so`가 있으면 GPU 디코드, 없으면 CPU(numpy) 자동 폴백;
+  `--cpu` 강제, `SLLM_GPU_DTYPE=bf16`로 공유 GPU에서도 device-resident(고속) 활성
+- **vLLM 스타일 진단** — 시작 배너(버전/아키텍처/백엔드/가중치/캐시), 요청 통계
+  (`prompt/out`, `tokens/s`, `finish`), `--log-level`/`SLLM_LOG_LEVEL`
+- **레시피 기반 설정** — 모델 정보는 `recipes/*.yaml`, 클러스터/서빙 공통은
+  `config.env`(노드 IP, 포트, 이미지…); 프리시던스 CLI > 레시피 > config.env
+- **TP2 듀얼노드** — 2노드 텐서 병렬 계획/워커 기동(클러스터 실행 마일스톤 게이트)
+- **자체 CUDA 커널** — attention/재귀/희소/FP8/fused 커널을 자체 작성,
+  Dense GEMM(cuBLAS)과 통신(NCCL)은 툴체인 재사용
 
-```bash
-# Dependencies are VERSION-PINNED in requirements.txt (runtime only; dev/
-# validation packages like ml_dtypes/tokenizers/torch are not shipped).
+## 기술 설명
 
-# container image (recommended for deployment) -- pinned deps + runtime-only files
-./build.sh
-
-# native install on a node (venv + pinned deps + GPU kernels)
-./build.sh --native
-```
-
-The container image ships the **deployment-only** source tree: dev/validation
-resources (`tests/`, `bench/`, `oracle/`, `demo/`, `docs/`, vendored
-`ref/hf_sources/`, dev entrypoints `serving/cli.py` / `serving/dev_model.py`)
-are excluded via `.dockerignore` and the Dockerfile's explicit COPY list.
-
-No install step is required for the Python paths — run `python -m ...` from
-the repository root.
-
----
-
-## 3. Configuration
-
-Configuration is split in two places, intentionally:
-
-- **Recipe = the model** (identity, geometry, `defaults:`, `env:`, `command:`
-  template, weights `paths.local_dir`).
-- **`config.env` = common cluster / serving settings** (node IPs, pair link,
-  fallback bind address/port, toolchain, image).
-
-| Key (`config.env`) | Meaning | Default |
-|---|---|---|
-| `SLLM_HEAD_IP` / `SLLM_WORKER_IP` | SSH/coordination address of each node | 192.168.0.250 / .231 |
-| `SLLM_HEAD_PAIR_IP` / `SLLM_WORKER_PAIR_IP` | internal pair-link addresses (NCCL) | 10.100.25.1 / .2 |
-| `SLLM_PAIR_IFACE` | pair-link NIC name on **this** node | (empty) |
-| `SLLM_HOST` | serve bind address when the recipe has no `defaults.host` | 0.0.0.0 |
-| `SLLM_PORT` | serve bind port when the recipe has no `defaults.port` | 8002 |
-| `SLLM_IMAGE` | container image for `sllm` | sllm-node:latest |
-| `SLLM_NODE_WEIGHT_BUDGET_GIB` | max weights GiB per node for a lower-TP override | 110 |
-| `NVCC_ARCH` | nvcc target for `kernels/cuda/build.sh` | native |
-| `Q27B_TOKENIZER_DIR` | tokenizer snapshot dir (tests/dev only) | (empty) |
-
-**Precedence:** CLI flag > recipe `defaults:` > `config.env` > built-in
-default. Real environment variables always win over `config.env`
-(`config.env > code default` is the fallback chain for the rest).
-
-- Serving host/port primarily come from the **recipe**
-  (`defaults.host` / `defaults.port`); `SLLM_HOST` / `SLLM_PORT` are the
-  fallback for paths without a recipe.
-- Node-pair IPs come from **`config.env`** (`tp/topology.py`).
-- The `sllm` launcher bind-mounts the host's **live `config.env`** into the
-  container, so changing node IPs / port / host on the node applies without
-  rebuilding the image.
+- **디렉터리**: `ref/`(모델 numpy 오라클), `serving/`(엔진·HTTP·LLM CLI·토크나이저),
+  `runtime/`(샘플러·메모리 배치·스케줄러·스펙 디코드), `loaders/`(fp8/fp4 로더·샤딩),
+  `kernels/`(CUDA), `tp/`(텐서 병렬), `recipes/`(모델 정의)
+- **엔진별 구성**: qwen3_5 = GDN+full-attn 증분 디코드; qwen4_exp = HC+Gating+QSA+MoE+PLE
+  (numpy 파이프라인 + MTP 스펙); deepseek_v4 = MLA+압축+인덱서+MoE+DSPark 스펙
+  디코드; 표준 = GQA+RoPE 증분/GPU 디코드
+- **검증 방식**: torch 없이 순수 numpy 오라클 — greedy 정체성(spec 디코드 출력 ==
+  plain greedy) 및 실 체크포인트 부분 패리티, bf16 노이즈 플로어를 기준으로 삼음
+- **설계 문서**: [`docs/design/01-architecture.md`](docs/design/01-architecture.md)
+  등 설계/감사/로드맵 01–10 참조
 
 ---
 
-## 4. Quick start
+## 설치
 
-### 4.1 Plan (no GPU, safe anywhere)
-
-```bash
-sllm recipes/Qwen3.8-Flash-Next-FP8.yaml            # default mode = plan
-sllm recipes/Qwen3.8-27B-FP8.yaml --tp 1            # force a 1-node plan
-```
-
-`plan` resolves everything and prints the run plan (rank table, weights,
-cache budget, serving address) without executing.
-
-### 4.2 Run (one-shot chat)
+요구사항: Python 3.10+, `numpy`/`pyyaml`/`regex`/`jinja2`(버전은
+`requirements.txt`에 고정), 컨테이너 운영에는 Docker + NVIDIA 컨테이너 툴킷,
+GPU 커널 빌드는 CUDA 13(nvcc). GitHub에서:
 
 ```bash
-sllm recipes/Qwen2.5-Coder-0.5B.yaml --mode run --chat "say hi" --max-new 16
+git clone https://github.com/skfine24/sLLM.git && cd sLLM
 ```
 
-### 4.3 Serve (OpenAI-compatible HTTP API)
+### 단일 노드 (SOLO)
 
 ```bash
-sllm recipes/Qwen2.5-Coder-0.5B.yaml --mode serve   # OpenAI API on :8002
+./build.sh                 # 컨테이너 이미지 (sllm-node:latest, pinned deps, 배포 전용 소스)
+# 또는
+./build.sh --native        # 노드 venv 설치(동일 고정 deps + GPU 커널 빌드)
+
+# per-node config.env: 노드 IP/pair/포트 확인 및 수정
 ```
 
-The same entry runs natively from the repository root:
+### 듀얼 노드 (TP2)
+
+모든 노드는 **동일한 컨테이너**를 사용합니다.
 
 ```bash
-python -m serving.main recipes/Qwen2.5-Coder-0.5B.yaml --mode serve \
-    --host 127.0.0.1 --port 8002
+# head(192.168.0.250)와 worker(192.168.0.231) 각각에서 동일하게
+./build.sh -tp2            # 듀얼노드용 빌드(이미지는 동일)
+
+# config.env(양쪽 노드): SLLM_HEAD_IP/WORKER_IP, PAIR IP, SLLM_PAIR_IFACE(각 노드 NIC)
+# 모델 가중치는 양쪽 모두 $HOME/models/<model> (paths.local_dir)
 ```
 
-### 4.4 Dev / tiny engines (no weights, no GPU)
-
-```bash
-python -m serving.cli --chat "hello"                # tiny standard model
-python -m serving.cli --qwen4 --chat "hi"           # tiny qwen4_exp (HC+GDN+QSA+MoE)
-python -m serving.cli --batch "a b" "c d"           # continuous batching demo
-python -m serving.server                            # tiny model HTTP stub ($SLLM_PORT / 8000)
-```
+빌드 확인: `python -m serving.main --version` → `sllm 0.1.0 (…rev)`.
 
 ---
 
-## 5. CLI reference
+## 구동 방법
 
-### Docker launcher (`sllm <recipe>`)
-
-```
-sllm <recipe> [--tp|--nodes 1|2] [--mode plan|run|serve]
-             [--host H] [--port P] [--chat TEXT] [--max-new N]
-             [--model-dir D] [--dry]
-```
-
-| Flag | Meaning |
-|---|---|
-| `--tp / --nodes N` | drive shape (1 or 2); default from the recipe. A lower value is accepted only when `defaults.weights_gib` provably fits one node |
-| `--mode` | `plan` (default) / `run` / `serve` |
-| `--host / --port` | override the resolved bind address / port |
-| `--chat TEXT / --max-new N` | one-shot run input / length |
-| `--model-dir D` | override the recipe weights location |
-| `--dry` | print the docker command without running it |
-
-### Native entry (`python -m serving.main`)
-
-Same flags plus:
-
-| Flag | Meaning |
-|---|---|
-| `--log-level L` | `TRACE\|DEBUG\|INFO\|WARNING\|ERROR` (default `$SLLM_LOG_LEVEL`/INFO) |
-| `--version` / `-V` | print `sllm <version> (<git rev>)` and exit |
-
----
-
-## 6. HTTP API (OpenAI-compatible)
-
-Endpoints served by `--mode serve`:
-
-| Endpoint | Description |
-|---|---|
-| `GET /health` | `{"status": "ok", "model": ...}` |
-| `GET /v1/models` | list the served model |
-| `POST /v1/chat/completions` | chat completion (OpenAI schema + `usage`) |
-| `POST /v1/completions` | text completion |
+### 계획 (GPU/가중치 없이 안전)
 
 ```bash
+./sllm recipes/Qwen3.8-27B-FP8.yaml --mode plan
+```
+
+### 원샷 생성
+
+```bash
+./sllm recipes/Qwen2.5-Coder-0.5B.yaml --mode run --chat "hi" --max-new 16
+```
+
+### 서빙 (OpenAI API)
+
+```bash
+./sllm recipes/Qwen2.5-Coder-0.5B.yaml --mode serve        # :8002
+curl http://127.0.0.1:8002/v1/models
 curl http://127.0.0.1:8002/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen2.5-Coder-0.5B","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
+     -H 'Content-Type: application/json' \
+     -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 ```
 
-`"stream": true` returns an **SSE** token stream (`data:` frames terminated by
-`data: [DONE]`). Body fields: `messages` (chat) / `prompt` (completions),
-`max_tokens` (or `max_new`), `temperature`, `top_k`, `top_p`, `seed`.
+`./sllm <recipe> [--tp 1|2] [--mode plan|run|serve] [--port P] [--host H]
+[--chat TEXT] [--max-new N] [--cpu] [--dry]` — 프리시던스: CLI > 레시피
+`defaults:` > `config.env` > 내장.
+
+### 트러블슈팅용 옵션
+
+- GPU: 기본 AUTO — 시작 시 `GPU decode enabled (CUDA devices visible: N)` 또는
+  `GPU unavailable -> CPU (numpy) decode` 로그로 확인
+- `--cpu`(강제 CPU) / `SLLM_USE_GPU=0` / `SLLM_GPU_DTYPE=bf16`(공유 GPU에서
+  device-resident 가속)
+- `--log-level DEBUG` — 토큰 단위 디버그
 
 ---
 
-## 7. Serving standard checkpoints (`serve_standard`)
+## 라이선스
 
-For real Llama/Qwen2-family checkpoints:
-
-```bash
-# one-shot
-python -m serving.serve_standard --model-dir ~/models/Qwen2.5-Coder-0.5B \
-    --prompt "def fib(n):" --max-new 16
-# continuous-batch
-python -m serving.serve_standard --model-dir ~/models/Qwen2.5-Coder-0.5B \
-    --batch "p1" "p2"
-# HTTP serve
-python -m serving.serve_standard --model-dir ~/models/Qwen2.5-Coder-0.5B \
-    --serve --host 0.0.0.0 --port 8002
-```
-
-Options: `--host` / `--port` (`$SLLM_HOST` / `$SLLM_PORT` fallback),
-`--kv-placement device|host`, `--gpu-dtype fp32|bf16`.
-
-**GPU policy (default = AUTO):** the engine uses GPU/CUDA decode whenever the
-installed environment has a CUDA device + a built `sllm_gpu.so`, and falls
-back to CPU (numpy) otherwise — the decision is printed at startup
-(`GPU decode enabled (CUDA devices visible: N)` / `GPU unavailable -> CPU`).
-Force CPU with `--cpu` (or `SLLM_USE_GPU=0`); force GPU with `--use-gpu`
-(or `SLLM_USE_GPU=1`). Any runtime failure also degrades to CPU transparently.
-
----
-
-## 8. Diagnostics (vLLM-style)
-
-Every engine prints a **startup banner** (version, model, backend, weights,
-cache budget, arch details) and **per-request stats** (`prompt/out tokens`,
-wall time, `tokens/s`, finish reason) as tag-prefixed lines on **stderr**:
-
-```
-13:07:30 INFO  [sllm] tiny/qwen4_exp (arch=qwen4_exp)
-13:07:30 INFO  [sllm]   version       : 0.1.0 (a12545a)
-13:07:30 INFO  [sllm]   architecture  : qwen4_exp
-13:07:51 INFO  [gen] prompt=5 out=2 wall=0.006s (351.8 tokens/s) finish=length
-13:07:51 INFO  [http] POST /v1/chat/completions -> 200 7.2ms
-```
-
-- Levels: `TRACE` (per-op) / `DEBUG` (per-token ids + arch detail) / `INFO`
-  (banner + request stats, default) / `WARNING` / `ERROR`.
-- Set via `--log-level L` or the `SLLM_LOG_LEVEL` env var.
-- Per-token detail (token id + top-1) is at `DEBUG`.
-
----
-
-## 9. Container operation
-
-```bash
-deploy/run.sh build                       # build sllm-node:latest
-deploy/run.sh kernel                      # GPU kernel smoke
-SLLM_BATCH="p1;p2" deploy/run.sh batch    # continuous-batch one-shot
-deploy/run.sh serve                       # HTTP serving (MODEL_DIR=... override)
-```
-
-The `sllm` launcher bind-mounts the host's **live `config.env`** (and a recipe
-from outside the repo) into the container, so editing cluster/serving settings
-on the node does not require a rebuild.
-
----
-
-## 10. KV memory placement
-
-`memory.kv_placement` in the recipe (`device` default | `host`):
-
-| Placement | Behaviour | OOM safety |
-|---|---|---|
-| `device` | weights + compute + KV on the GPU, admission rejects overflow | hard bound from the planned budget |
-| `host` | KV / recurrent state in host RAM, gathered per decode step | recoverable failure / swap |
-
-CPU/numpy mode always uses host RAM. CLI override:
-`serve_standard --kv-placement device|host`.
-
----
-
-## Design documents
-
-- [`docs/design/01-architecture.md`](docs/design/01-architecture.md) — architecture, data flow, directory layout
-- [`docs/design/02-recipes-kernels.md`](docs/design/02-recipes-kernels.md) — recipe schema, per-model kernel inventory
-- [`docs/design/03-runtime-tp.md`](docs/design/03-runtime-tp.md) — batching/scheduling, KV/memory, tensor parallelism
-- [`docs/design/04-validation-phases.md`](docs/design/04-validation-phases.md) — parity/perf methodology and phase plan
-- [`docs/design/08-cluster-layout.md`](docs/design/08-cluster-layout.md) — GB10 pair, vLLM coexistence
-- [`docs/design/09-roadmap-seq-qwen4exp-dsv4.md`](docs/design/09-roadmap-seq-qwen4exp-dsv4.md) — qwen4_exp → deepseek_v4 roadmap
-- [`docs/design/10-deepseek-v4-vision-track.md`](docs/design/10-deepseek-v4-vision-track.md) — DeepSeek-V4 vision track
+원본 코드는 MIT 라이선스입니다 (`LICENSE`). 일부 분석용 벤더드 소스
+(`ref/hf_sources/`, `oracle/upstream/` — Qwen/DeepSeek/transformers/sglang)와
+모델 가중치는 각각의 라이선스를 따르며 배포 이미지에는 포함되지 않습니다
+(자세한 내용은 `THIRD_PARTY_NOTICES.md`).
