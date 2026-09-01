@@ -31,7 +31,7 @@ command -v "$PYBIN" >/dev/null || PYBIN=python
 usage() {
   echo "usage: sllm <recipe.yaml> [--tp|--nodes 1|2] [--mode plan|run|serve]"
   echo "          [--port P] [--host H] [--chat TEXT] [--max-new N]"
-  echo "          [--model-dir D] [--cpu] [--dry]"
+  echo "          [--model-dir D] [--placement device|um] [--cpu] [--dry]"
   exit 1
 }
 [[ $# -ge 1 ]] || usage
@@ -70,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --host) HOST="$2"; shift 2;;  --mode) MODE="$2"; shift 2;;
     --chat) CHAT="$2"; shift 2;;  --max-new) MAXNEW="$2"; shift 2;;
     --model-dir) MDIR="$2"; shift 2;; --cpu) CPU=1; shift;;
+    --placement) SLLM_PLACEMENT="$2"; shift 2;;
     --dry) DRY=1; shift;;
     *) usage;;
   esac
@@ -102,6 +103,11 @@ if [[ "$CPU" == 1 ]]; then
   RUN+=(-e "SLLM_USE_GPU=0")
 elif [[ -n "${SLLM_USE_GPU:-}" ]]; then
   RUN+=(-e "SLLM_USE_GPU=$SLLM_USE_GPU")
+fi
+# placement: default device (GPU-RESIDENT weights+KV); um = host RAM mode
+if [[ -n "${SLLM_PLACEMENT:-}" ]]; then
+  RUN+=(-e "SLLM_PLACEMENT=$SLLM_PLACEMENT")
+  [[ "$SLLM_PLACEMENT" == "um" ]] && RUN+=(-e "SLLM_USE_GPU=0")
 fi
 # resident decode dtype (fp32|bf16) -- halves resident weights, lets
 # device-resident decode fit on a shared GB10 GPU

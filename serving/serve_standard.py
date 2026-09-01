@@ -55,14 +55,20 @@ def main(argv=None):
                          "(default is AUTO: GPU if CUDA+.so, else CPU)")
     ap.add_argument("--cpu", action="store_true",
                     help="force CPU (numpy) decode even when CUDA is present "
-                         "(same as SLLM_USE_GPU=0)")
+                         "(same as SLLM_USE_GPU=0 / --placement um)")
+    ap.add_argument("--placement", choices=("device", "um"), default=None,
+                    help="device = GPU-RESIDENT weights+KV (DEFAULT when "
+                         "CUDA+.so present); um = host RAM / unified-memory "
+                         "mode (model+KV in RAM, CPU compute)")
     ap.add_argument("--gpu-dtype", choices=["fp32", "bf16"], default=None,
                     help="device-resident decode dtype for weights/KV "
                          "(env SLLM_GPU_DTYPE; default fp32)")
     ap.add_argument("--serve", action="store_true", help="start HTTP server instead of one-shot")
     args = ap.parse_args(argv)
 
-    if args.cpu:
+    if args.placement:
+        os.environ["SLLM_PLACEMENT"] = args.placement
+    if args.placement == "um" or args.cpu:
         os.environ["SLLM_USE_GPU"] = "0"
     elif args.use_gpu:
         os.environ["SLLM_USE_GPU"] = "1"

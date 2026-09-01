@@ -323,11 +323,19 @@ def main(argv=None) -> int:
                     help="force CPU (numpy) decode even when CUDA is present "
                          "(same as SLLM_USE_GPU=0; default is AUTO: GPU if "
                          "CUDA+.so, else CPU)")
+    ap.add_argument("--placement", choices=("device", "um"), default=None,
+                    help="device = GPU-RESIDENT weights+KV (DEFAULT when "
+                         "CUDA+.so present); um = host RAM / unified-memory "
+                         "mode (model+KV in RAM, CPU compute)")
     ap.add_argument("--version", "-V", action="store_true",
                     help="print the sLLM version and exit")
     args = ap.parse_args(argv)
     diag.set_level(args.log_level)
-    if args.cpu:
+    if args.placement:
+        os.environ["SLLM_PLACEMENT"] = args.placement
+        if args.placement == "um":
+            os.environ["SLLM_USE_GPU"] = "0"
+    elif args.cpu:
         os.environ["SLLM_USE_GPU"] = "0"
     if args.version:
         from serving.version import version_string

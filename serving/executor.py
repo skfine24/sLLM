@@ -43,6 +43,15 @@ class ReferenceModel:
         # q4_cfg, it falls back to DeepseekV4Cfg.from_recipe when not given.
         self.dsv4_cfg = dsv4_cfg
         self.vision_cfg = vision_cfg
+        # Placement (DESIGN-DEFAULT = device = GPU-RESIDENT): weights + KV are
+        # uploaded to the GPU once and decode runs on-device (falls back to
+        # transfer/numpy transparently on any failure or when no CUDA/.so is
+        # present). `um` = host RAM/unified-memory mode (the old CPU-ominant
+        # behaviour: model + KV live in RAM, GPU used per-step only). Select
+        # with --placement / SLLM_PLACEMENT=um|device (default device).
+        placement = (os.environ.get("SLLM_PLACEMENT") or "device").strip().lower()
+        self.placement = "um" if placement in ("um", "host", "cpu", "ram") \
+            else "device"
         # GPU decode toggle. DEFAULT: auto -- GPU/CUDA when the installed
         # environment has a CUDA device + a built sllm_gpu.so, CPU (numpy)
         # otherwise; the decode loop also degrades to numpy on any runtime
@@ -52,12 +61,19 @@ class ReferenceModel:
         if use_gpu is not None:
             self.use_gpu = bool(use_gpu)
             self.gpu_mode = "off" if not self.use_gpu else "force"
+        elif self.placement == "um":
+            self.use_gpu = False
+            self.gpu_mode = "off"
         elif gpu_env in ("0", "false", "off", "cpu", "none", "numpy"):
             self.use_gpu = False
             self.gpu_mode = "off"
         else:
             self.use_gpu = True
             self.gpu_mode = "auto" if gpu_env in ("", "auto") else "force"
+        # prefer device-resident (weights+KV on GPU) when placement=device and
+        # the GPU path is enabled; hybrid (qwen3_5 GDN) resident kernels are
+        # the cluster milestone -- until then hybrid falls back to transfer.
+        self.resident_preferred = self.placement == "device" and self.use_gpu
         # Device-resident decode dtype (weights/KV): fp32 | bf16
         # (env SLLM_GPU_DTYPE; fp32 default until wider validation).
         self.gpu_dtype = (gpu_dtype or os.environ.get("SLLM_GPU_DTYPE", "fp32")).lower()
@@ -213,7 +229,8 @@ class ReferenceModel:
         if self._is_dsv4:
             return self._dsv4model().decode_step(cache, last_id)
         if self.use_gpu and self._gpu_available():
-            if (self.recipe.full_attention.kernel == "standard_gqa"
+            if (self.resident_preferred
+                    and self.recipe.full_attention.kernel == "standard_gqa"
                     and not self._resident_off):
                 try:
                     return self._resident_step(cache, last_id)

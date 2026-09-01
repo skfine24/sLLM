@@ -110,10 +110,12 @@ curl http://127.0.0.1:8002/v1/chat/completions \
 
 ### 트러블슈팅용 옵션
 
-- GPU: 기본 AUTO — 시작 시 `GPU decode enabled (CUDA devices visible: N)` 또는
-  `GPU unavailable -> CPU (numpy) decode` 로그로 확인
-- `--cpu`(강제 CPU) / `SLLM_USE_GPU=0` / `SLLM_GPU_DTYPE=bf16`(공유 GPU에서
-  device-resident 가속)
+- 배치(기본 **device = GPU 상주**): CUDA+`.so`가 있으면 가중치+KV를 GPU에
+  업로드해 device-resident 디코드, 실패 시 자동 CPU 폴백. RAM/CPU(옛 방식)는
+  **`--placement um`**(= `--cpu` / `SLLM_USE_GPU=0`). `--use-gpu`로 GPU 강제,
+  `SLLM_GPU_DTYPE=bf16`은 공유 GB10에서 상주 가중치가 들어가게 함
+- 시작 시 `placement …`/`backend …` 로그로 확인 (`GPU decode enabled …` /
+  `GPU unavailable -> CPU …`)
 - `--log-level DEBUG` — 토큰 단위 디버그
 
 ---

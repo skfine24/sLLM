@@ -30,25 +30,30 @@ class TestGpuPolicyAuto(unittest.TestCase):
     the decode loop resolves against _gpu_available() and falls back to numpy
     when no CUDA/.so is present; SLLM_USE_GPU=0 forces CPU."""
 
-    def _model(self, env_val):
-        old = os.environ.get("SLLM_USE_GPU")
-        if env_val is None:
-            os.environ.pop("SLLM_USE_GPU", None)
-        else:
-            os.environ["SLLM_USE_GPU"] = env_val
+    def _model(self, use_gpu_env=None, placement=None):
+        saved = {k: os.environ.get(k) for k in ("SLLM_USE_GPU", "SLLM_PLACEMENT")}
+        for k in ("SLLM_USE_GPU", "SLLM_PLACEMENT"):
+            os.environ.pop(k, None)
+        if use_gpu_env is not None:
+            os.environ["SLLM_USE_GPU"] = use_gpu_env
+        if placement is not None:
+            os.environ["SLLM_PLACEMENT"] = placement
         try:
             return ReferenceModel(tiny_standard_recipe(),
                                   tiny_standard_weights(np.random.default_rng(3)))
         finally:
-            if old is None:
-                os.environ.pop("SLLM_USE_GPU", None)
-            else:
-                os.environ["SLLM_USE_GPU"] = old
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def test_auto_default_is_gpu_mode(self):
-        m = self._model(None)               # env unset -> AUTO
+        m = self._model(None)               # env unset -> AUTO + device
         self.assertTrue(m.use_gpu)
         self.assertEqual(m.gpu_mode, "auto")
+        self.assertEqual(m.placement, "device")
+        self.assertTrue(m.resident_preferred)
 
     def test_env_zero_forces_cpu(self):
         m = self._model("0")
@@ -59,6 +64,12 @@ class TestGpuPolicyAuto(unittest.TestCase):
         m = self._model("1")
         self.assertTrue(m.use_gpu)
         self.assertEqual(m.gpu_mode, "force")
+
+    def test_placement_um_forces_cpu(self):
+        m = self._model(None, "um")
+        self.assertEqual(m.placement, "um")
+        self.assertFalse(m.use_gpu)
+        self.assertEqual(m.gpu_mode, "off")
 
     def test_auto_generation_equals_explicit_cpu(self):
         # auto (use_gpu=True) either uses the GPU or falls back to numpy; the

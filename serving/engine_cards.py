@@ -45,6 +45,8 @@ def _backend(model) -> str:
         return "numpy (oracle + device-resident state)"
     if isq:
         return "numpy (CPU pipeline; GPU kernels are milestone Q4-GPU)"
+    if getattr(model, "placement", "device") == "um":
+        return "numpy (host RAM; unified-memory mode)"
     mode = getattr(model, "gpu_mode", "auto")
     if getattr(model, "use_gpu", False):
         if getattr(model, "_gpu_available", lambda: False)():
@@ -82,6 +84,7 @@ def common(recipe, weights, model) -> list[str]:
         f"architecture  : {recipe.arch}",
         f"model         : {recipe.model_id}",
         f"vocab / ctx   : {vocab} / {ctx}",
+        f"placement     : {('um (host RAM; model+KV in RAM)' if getattr(model, 'placement', 'device') == 'um' else 'device (GPU-resident weights+KV; auto fallback)')}",
         f"backend       : {_backend(model)}",
         f"vision        : {_vision(recipe, model)}",
         f"weights       : {n} tensors, {_gib(b)}",
