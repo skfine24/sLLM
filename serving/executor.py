@@ -127,6 +127,8 @@ class ReferenceModel:
         if self._dev_table is None:
             self._dev_table = DeviceWeightTable(self.weights, self.recipe,
                                                 dtype=self.gpu_dtype)
+            diag.info("sllm", f"device-resident decode active "
+                              f"(dtype={self.gpu_dtype}, weights on GPU)")
         state = getattr(cache, "_resident", None)
         if state is None or state.table is not self._dev_table:
             if state is not None:
