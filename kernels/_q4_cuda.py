@@ -28,12 +28,26 @@ _Q4_ENTRIES = (
     "sllm_q4_axpy_rows", "sllm_q4_shared_gate_accum",
 )
 
+# device-pointer (C1) variants: the caller passes GPU pointers (from
+# kernels._sllm_cuda.DeviceBuffer); no host malloc/copy. Kept as a separate
+# symbol set so a pre-C1 .so still loads (available() reports the base set).
+_Q4_DEV_ENTRIES = (
+    "sllm_q4_grouped_gemma_rmsnorm_dev", "sllm_q4_gemv_rows_dev",
+    "sllm_q4_hc_mix_apply_dev", "sllm_q4_hc_combine_dev",
+    "sllm_q4_gemma_rmsnorm_dev", "sllm_q4_rope_partial_dev",
+    "sllm_q4_qsa_pool_block_dev", "sllm_q4_qsa_mqa_logits_dev",
+    "sllm_q4_qsa_topk_dev", "sllm_q4_qsa_sparse_attn_dev",
+    "sllm_q4_moe_router_dev", "sllm_q4_swiglu_dev", "sllm_q4_axpy_rows_dev",
+    "sllm_q4_shared_gate_accum_dev",
+)
+
 _g = None
+_g_dev_ok = False
 _lib_failed = False
 
 
 def _setup():
-    global _g, _lib_failed
+    global _g, _lib_failed, _g_dev_ok
     if _g is not None or _lib_failed:
         return _g
     try:
@@ -62,6 +76,29 @@ def _setup():
         lib.sllm_q4_shared_gate_accum.argtypes = [F, F, F, I, I]
         for n in _Q4_ENTRIES:
             getattr(lib, n).restype = c_int
+        if all(hasattr(lib, name) for name in _Q4_DEV_ENTRIES):
+            lib.sllm_q4_grouped_gemma_rmsnorm_dev.argtypes = [F, F, F, I, I, I,
+                                                              c_float]
+            lib.sllm_q4_gemv_rows_dev.argtypes = [F, F, F, I, I, I, I, c_float]
+            lib.sllm_q4_hc_mix_apply_dev.argtypes = [F, F, F, I, I, I]
+            lib.sllm_q4_hc_combine_dev.argtypes = [F, F, F, F, I, I, I]
+            lib.sllm_q4_gemma_rmsnorm_dev.argtypes = [F, F, F, I, I, c_float]
+            lib.sllm_q4_rope_partial_dev.argtypes = [F, F, F, I, I, I]
+            lib.sllm_q4_qsa_pool_block_dev.argtypes = [F, F, I, I, I]
+            lib.sllm_q4_qsa_mqa_logits_dev.argtypes = [F, F, F, I, I, I, I,
+                                                       c_float]
+            lib.sllm_q4_qsa_topk_dev.argtypes = [F, P, I, I, I, I, I]
+            lib.sllm_q4_qsa_sparse_attn_dev.argtypes = [F, F, F, P, F, I, I, I,
+                                                        L, I, c_float]
+            lib.sllm_q4_moe_router_dev.argtypes = [F, F, P, I, I, I]
+            lib.sllm_q4_swiglu_dev.argtypes = [F, F, F, L]
+            lib.sllm_q4_axpy_rows_dev.argtypes = [F, F, F, I, I]
+            lib.sllm_q4_shared_gate_accum_dev.argtypes = [F, F, F, I, I]
+            for n in _Q4_DEV_ENTRIES:
+                getattr(lib, n).restype = c_int
+            _g_dev_ok = True
+        else:
+            _g_dev_ok = False
         _g = lib
     except Exception:
         _lib_failed = True
@@ -71,6 +108,11 @@ def _setup():
 
 def available() -> bool:
     return _setup() is not None
+
+
+def dev_available() -> bool:
+    """True when the loaded .so also exports the device-pointer (C1) variants."""
+    return _setup() is not None and _g_dev_ok
 
 
 def _lib():
@@ -271,3 +313,112 @@ def shared_gate_accum(out, shared, g) -> np.ndarray:
         out.ctypes.data_as(POINTER(c_float)), _fp(shared), _fp(g),
         out.shape[0], out.shape[1]))
     return out
+
+
+# ---------------------------------------------------------------------------
+# device-resident (C1) variants: take kernels._sllm_cuda.DeviceBuffer /
+# DeviceView (use `.ptr`) or a raw ctypes pointer. No host copies -- the
+# caller owns the buffers and the single ck.sync() per step.
+# ---------------------------------------------------------------------------
+
+def _dev(lib, name):
+    fn = getattr(lib, name, None)
+    if fn is None:
+        raise RuntimeError(f"q4 device kernel {name} missing from sllm_gpu.so "
+                           f"(rebuild kernels/cuda with the C1 qwen4.cu)")
+    return fn
+
+
+def _ptr(buf):
+    """Resolve a DeviceBuffer/DeviceView (or raw pointer) to a ctypes pointer."""
+    p = getattr(buf, "ptr", buf)
+    return p
+
+
+def grouped_gemma_rmsnorm_dev(x, w, y, hc, hs, eps=1e-6):
+    rows = int(np.prod(x.shape[:-1])) if not isinstance(x, ctypes.c_void_p) \
+        else 0
+    _check(_dev(_lib(), "sllm_q4_grouped_gemma_rmsnorm_dev")(
+        _ptr(x), _ptr(w), _ptr(y), rows, hc, hs, float(eps)))
+
+
+def gemv_rows_dev(A, W, out, rows, K, O, post=0, scale=1.0):
+    _check(_dev(_lib(), "sllm_q4_gemv_rows_dev")(_ptr(A), _ptr(W), _ptr(out),
+                                                 rows, K, O, int(post),
+                                                 float(scale)))
+
+
+def hc_mix_apply_dev(wgate, normed, mixed, rows, hc, hs):
+    _check(_dev(_lib(), "sllm_q4_hc_mix_apply_dev")(_ptr(wgate), _ptr(normed),
+                                                    _ptr(mixed), rows, hc, hs))
+
+
+def hc_combine_dev(hyper, block_out, normed, inj_w, rows, hc, hs):
+    _check(_dev(_lib(), "sllm_q4_hc_combine_dev")(_ptr(hyper), _ptr(block_out),
+                                                  _ptr(normed), _ptr(inj_w),
+                                                  rows, hc, hs))
+
+
+def gemma_rmsnorm_dev(x, w, y, rows, d, eps=1e-6):
+    _check(_dev(_lib(), "sllm_q4_gemma_rmsnorm_dev")(_ptr(x), _ptr(w), _ptr(y),
+                                                     rows, d, float(eps)))
+
+
+def rope_partial_dev(x, cos, sin, rows, d, rot):
+    _check(_dev(_lib(), "sllm_q4_rope_partial_dev")(_ptr(x), _ptr(cos),
+                                                    _ptr(sin), rows, d,
+                                                    int(rot)))
+
+
+def qsa_pool_block_dev(tok_k, out, end, ratio, d):
+    _check(_dev(_lib(), "sllm_q4_qsa_pool_block_dev")(_ptr(tok_k), _ptr(out),
+                                                      int(end), int(ratio),
+                                                      int(d)))
+
+
+def qsa_mqa_logits_dev(q, ck, logits, nh, d, start, end, scale):
+    _check(_dev(_lib(), "sllm_q4_qsa_mqa_logits_dev")(_ptr(q), _ptr(ck),
+                                                      _ptr(logits), nh, d,
+                                                      int(start), int(end),
+                                                      float(scale)))
+
+
+def qsa_topk_dev(logits, out, m, stride, start, end, topk):
+    rc = _dev(_lib(), "sllm_q4_qsa_topk_dev")(_ptr(logits), _ptr(out), m,
+                                              stride, int(start), int(end),
+                                              int(topk))
+    if rc == -2:
+        raise RuntimeError("row range exceeds v1 smem topk (C1 radix kernel)")
+    _check(rc)
+
+
+def qsa_sparse_attn_dev(q, k, v, slots, out, nh, kvh, hd, kcap, W, scale):
+    rc = _dev(_lib(), "sllm_q4_qsa_sparse_attn_dev")(_ptr(q), _ptr(k), _ptr(v),
+                                                     _ptr(slots), _ptr(out),
+                                                     nh, kvh, hd, int(kcap), W,
+                                                     float(scale))
+    if rc == -2:
+        raise RuntimeError("slot width exceeds v1 smem bound")
+    _check(rc)
+
+
+def moe_router_dev(logits, w_out, id_out, n, E, topk):
+    _check(_dev(_lib(), "sllm_q4_moe_router_dev")(_ptr(logits), _ptr(w_out),
+                                                  _ptr(id_out), n, E,
+                                                  int(topk)))
+
+
+def swiglu_dev(g, u, out, n):
+    _check(_dev(_lib(), "sllm_q4_swiglu_dev")(_ptr(g), _ptr(u), _ptr(out),
+                                              int(n)))
+
+
+def axpy_rows_dev(out, y, w, n, H):
+    _check(_dev(_lib(), "sllm_q4_axpy_rows_dev")(_ptr(out), _ptr(y), _ptr(w),
+                                                 n, H))
+
+
+def shared_gate_accum_dev(out, shared, g, n, H):
+    _check(_dev(_lib(), "sllm_q4_shared_gate_accum_dev")(_ptr(out),
+                                                         _ptr(shared), _ptr(g),
+                                                         n, H))

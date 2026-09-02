@@ -47,8 +47,18 @@ unlocks the three NVFP4 Qwen checkpoints); MoE oracle shares the Q3 design
 | Q4 | Engine integration: arch `qwen4_exp` through executor (CPU incremental first), then device kernels (reuse fused dtype machinery; GDN scan + QSA sparse attention kernels) | regression 161 tests green |
 | Q5 | Full-model path: TP2 dual-node plan execution + T3 live parity vs deployed sglang/vLLM; MTP-hybrid + PLE/ngram spec decode last | T3 |
 
-Track Q status (updated 2026-09-01; regression 357 OK / 34 cluster-skip):
+Track Q status (updated 2026-09-02; regression 409 OK / 39 cluster-skip):
 - Q1/Q2/Q4 DONE (oracles, pipeline, tiny fixture, engine path).
+- C1 single-node device-resident decode STARTED: `_dev` qwen4 kernels
+  (`kernels/cuda/qwen4.cu` device-pointer variants), `kernels/q4_device_decode.py`
+  (Q4DeviceWeightTable + Q4DeviceDecodeState, bf16 weights on device, GDN/QSA
+  caches host), wired into `serving/executor.py` decode_step (degrade to numpy).
+  Cluster-gated parity test `tests/test_q4_gpu_decode.py`; UNVERIFIED until a
+  CUDA build.
+- FP8 E4M3 block-dequant GEMM kernel (`kernels/cuda/fp8.cu` + `_fp8_cuda.py`,
+  naive parity stub first; tensor-core rewrite is the optimization) -- the
+  enabling primitive for the 173 GiB model. Cluster-gated
+  `tests/test_fp8_gemm.py`; UNVERIFIED until a CUDA build.
 - PLE/ngram + MTP-hybrid (Q3+ item) DONE locally: ngram oracle
   `ref/qwen4_exp_ple.py`, pipeline wiring `_ple_forward` (hyper `+= PLE`,
   shared ngram ctx + per-layer conv state), MTP fusion/draft
@@ -58,10 +68,9 @@ Track Q status (updated 2026-09-01; regression 357 OK / 34 cluster-skip):
   feature on the hyper stream) -- no router change needed.
 - Q3 (real-subset noise floor): cluster-gated via `bench/q4_subset_parity.py`.
 - Q5 TP2 plan: local sharding exists (`loaders.tp_shard.Qwen4ExpSharding` +
-  `tp/`); dual-node T3 live parity = cluster. Vision tower (VP170, `out_hidden
-  2560`) is the remaining unimplemented Q3+ item -- the vendored
-  `modeling_qwen4_exp.py` rotary-length arithmetic is not locally
-  torch-verifiable (rope_dim vs head_dim), so the port stays cluster-gated.
+  `tp/`); dual-node T3 live parity = cluster (NcclCollectives + tp/module +
+  2-process launcher still TODO). Vision tower (VP170, `out_hidden 2560`) is
+  the remaining unimplemented Q3+ item.
 
 ### Track D — deepseek_v4 (after Track Q)
 

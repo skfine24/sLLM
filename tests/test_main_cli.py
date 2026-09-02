@@ -99,7 +99,7 @@ class TestSllmMain(unittest.TestCase):
     def test_run_real_q4_is_gated(self):
         with self.assertRaises(SystemExit) as cm:
             sllm_main.main(["Qwen3.8-Flash-Next-FP8.yaml", "--mode", "run"])
-        self.assertIn("C phase", str(cm.exception))
+        self.assertIn("real qwen4_exp weights need", str(cm.exception))
 
     def test_run_passes_chat_messages(self):
         # regression: run mode used to pass a raw str where chat() expects

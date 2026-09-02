@@ -207,9 +207,11 @@ def _build_engine(recipe: Recipe, model_dir: str | None):
         return build_dev_engine()
     if recipe.arch == "qwen4_exp":
         raise SystemExit(
-            "sllm: real qwen4_exp weights need the exclusive-GPU "
-            "milestones (C phase: fp8 GEMM kernels + device-resident state). "
-            "Use --mode plan, or a tiny/ recipe for the dev engine.")
+            "sllm: real qwen4_exp weights need the TP2 + fp8 device-resident "
+            "path (milestone Q5: dual-node + fp8 tensor-core GEMM + "
+            "device-resident state). Single-node C1 decode exists for "
+            "subset/tiny validation. Use --mode plan, or a tiny/ recipe for "
+            "the dev engine.")
     if recipe.arch == "qwen3_5":
         # Qwen3.8-27B-FP8 real engine: GDN linear-attn + paged full-attn via
         # the numpy incremental path (paged_flash + gated_delta_rule are in

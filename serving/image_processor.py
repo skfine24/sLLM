@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import io
 import math
+import os
 from dataclasses import dataclass
 from urllib.request import urlopen
 
@@ -36,6 +37,15 @@ class VisionArgs:
     max_n_token: int = 384
     min_pixels: int = 147456
     max_wh_ratio: float | None = 8.0
+    # SSRF / arbitrary-file-read guardrails: fetching a client-supplied remote
+    # URL or a server-local file path is OFF by default (data: URLs and base64
+    # `data`/`source.data` always work). Opt in explicitly.
+    fetch_urls: bool = False
+    fetch_files: bool = False
+
+
+def _flag(name: str, default: bool = False) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def grid_tokens(best_height, best_width, patch_size, downsample_ratio):
@@ -93,7 +103,16 @@ def safe_resize(height, width, best_height, best_width, patch_size,
     return n_llm_h, n_llm_w, best_height, best_width
 
 
-def load_image_bytes(record) -> bytes:
+def load_image_bytes(record, fetch_urls: bool = False,
+                     fetch_files: bool = False) -> bytes:
+    """Fetch raw image bytes from an OpenAI-style image record.
+
+    Only self-contained sources (base64 `data` / `source.data`, `data:` URLs)
+    are allowed by default. Remote ``http(s)`` URLs and bare filesystem paths
+    are disabled unless the caller opts in (``fetch_urls``/``fetch_files``) --
+    a client-supplied URL/path is an SSRF / arbitrary-file-read vector against
+    a network-exposed server.
+    """
     data = record.get("data")
     if isinstance(data, bytes):
         return data
@@ -104,7 +123,9 @@ def load_image_bytes(record) -> bytes:
         if source.get("data") is not None:
             return base64.b64decode(source["data"])
         if source.get("url"):
-            return load_image_bytes({"url": source["url"]})
+            return load_image_bytes({"url": source["url"]},
+                                    fetch_urls=fetch_urls,
+                                    fetch_files=fetch_files)
     url = record.get("url")
     if isinstance(url, str) and url:
         if url.startswith("data:"):
@@ -113,8 +134,16 @@ def load_image_bytes(record) -> bytes:
                 raise ValueError(f"Unsupported data URL encoding: {header}")
             return base64.b64decode(payload)
         if url.startswith(("http://", "https://")):
+            if not fetch_urls:
+                raise ValueError(
+                    "remote image URLs are disabled; set "
+                    "SLLM_VISION_FETCH_URLS=1 (or pass fetch_urls) to allow")
             with urlopen(url, timeout=30) as response:
                 return response.read()
+        if not fetch_files:
+            raise ValueError(
+                "local image file paths are disabled; set "
+                "SLLM_VISION_FETCH_FILES=1 (or pass fetch_files) to allow")
         with open(url, "rb") as file:
             return file.read()
     raise ValueError(f"Cannot load image from record: {list(record.keys())}")
@@ -123,7 +152,9 @@ def load_image_bytes(record) -> bytes:
 def load_image(record, args: VisionArgs | None = None):
     args = args or VisionArgs()
     p = args.patch_size
-    with Image.open(io.BytesIO(load_image_bytes(record))) as source:
+    with Image.open(io.BytesIO(load_image_bytes(
+            record, fetch_urls=args.fetch_urls,
+            fetch_files=args.fetch_files))) as source:
         image = source.convert("RGB")
     width, height = image.size
     if args.max_wh_ratio is not None and width > height * args.max_wh_ratio:

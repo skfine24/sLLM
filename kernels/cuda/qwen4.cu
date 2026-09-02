@@ -7,8 +7,10 @@
 //
 // v1 style matches the transfer-era API of kernels.cu (host pointers,
 // per-call H2D/D2H): the priority here is a PARITY-VERIFIABLE port of the
-// oracle semantics; device-resident composition (one sync per step, typed
-// operands) is milestone C1 and reuses the same __global__ bodies.
+// oracle semantics. Device-resident composition (C1) is provided as the
+// `sllm_q4_*_dev` variants below (device pointers, no host copies; one sync
+// per step is the caller's job) which reuse the same __global__ bodies --
+// consumed by kernels/q4_device_decode.py.
 //
 // GDN prefill/decode reuses sllm_gated_delta_step from kernels.cu (same
 // GatedDeltaNet family, verified in test_hybrid_gpu).
@@ -677,5 +679,136 @@ extern "C" int sllm_q4_qsa_sparse_attn(const float* q, const float* k,
   Q4_CHECK(cudaMemcpy(out, do_, (size_t)nh * hd * sizeof(float),
                       cudaMemcpyDeviceToHost));
   cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dsl); cudaFree(do_);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// device-resident (C1) variants: callers pass DEVICE pointers already on the
+// GPU (from kernels._sllm_cuda.DeviceBuffer). Same __global__ bodies; no
+// host malloc/copy -- one sync per step is the caller's job.
+// ---------------------------------------------------------------------------
+
+extern "C" int sllm_q4_grouped_gemma_rmsnorm_dev(const float* x, const float* w,
+                                                 float* y, int rows, int hc,
+                                                 int hs, float eps) {
+  if (rows <= 0 || hc <= 0 || hs <= 0) return -1;
+  grouped_gemma_rmsnorm_kernel<<<rows, 256>>>(x, w, y, rows, hc, hs, eps);
+  return 0;
+}
+
+extern "C" int sllm_q4_gemv_rows_dev(const float* A, const float* W,
+                                     float* out, int rows, int K, int O,
+                                     int post, float scale) {
+  if (rows <= 0 || K <= 0 || O <= 0) return -1;
+  size_t total = (size_t)rows * O;
+  int threads = 256;
+  gemv_rows_kernel<<<(unsigned)((total + threads - 1) / threads), threads>>>(
+      A, W, out, rows, K, O, post, scale);
+  return 0;
+}
+
+extern "C" int sllm_q4_hc_mix_apply_dev(const float* wgate,
+                                        const float* normed, float* mixed,
+                                        int rows, int hc, int hs) {
+  if (rows <= 0 || hc <= 0 || hs <= 0) return -1;
+  size_t total = (size_t)rows * hs;
+  hc_mix_apply_kernel<<<(unsigned)((total + 255) / 256), 256>>>(wgate, normed,
+                                                                mixed, rows,
+                                                                hc, hs);
+  return 0;
+}
+
+extern "C" int sllm_q4_hc_combine_dev(float* hyper, const float* block_out,
+                                      const float* normed,
+                                      const float* inj_w, int rows, int hc,
+                                      int hs) {
+  if (rows <= 0 || hc <= 0 || hs <= 0) return -1;
+  dim3 grid(rows, hc);
+  hc_combine_kernel<<<grid, 256>>>(hyper, block_out, normed, inj_w, rows, hc,
+                                   hs);
+  return 0;
+}
+
+extern "C" int sllm_q4_gemma_rmsnorm_dev(const float* x, const float* w,
+                                         float* y, int rows, int d,
+                                         float eps) {
+  if (rows <= 0 || d <= 0) return -1;
+  gemma_rmsnorm_kernel<<<rows, 256>>>(x, w, y, rows, d, eps);
+  return 0;
+}
+
+extern "C" int sllm_q4_rope_partial_dev(float* x, const float* cosb,
+                                        const float* sinb, int rows, int d,
+                                        int rot) {
+  if (rot <= 0 || rot % 2 || rot > d) return -1;
+  rope_partial_kernel<<<rows, 256>>>(x, cosb, sinb, rows, d, rot);
+  return 0;
+}
+
+extern "C" int sllm_q4_qsa_pool_block_dev(const float* tok_k, float* out,
+                                          int end, int ratio, int d) {
+  if (d <= 0 || ratio <= 0 || end < ratio) return -1;
+  pool_block_kernel<<<1, 256>>>(tok_k, out, end, ratio, d);
+  return 0;
+}
+
+extern "C" int sllm_q4_qsa_mqa_logits_dev(const float* q, const float* ck,
+                                          float* logits, int nh, int d,
+                                          int start, int end, float scale) {
+  if (nh <= 0 || d <= 0 || start < 0) return -1;
+  if (end <= start) return 0;
+  qsa_mqa_kernel<<<end - start, 256>>>(q, ck, logits, nh, d, start, scale);
+  return 0;
+}
+
+extern "C" int sllm_q4_qsa_topk_dev(const float* logits, int* out, int m,
+                                    int stride, int start, int end, int topk) {
+  if (m <= 0 || topk <= 0 || start < 0 || end <= start) return -1;
+  int len = end - start;
+  if (len > Q4_MAX_SMEM_ROWS) return -2;  // C1 adds the radix fast-topk
+  qsa_topk_sm_kernel<<<m, 256, (size_t)(len > 0 ? len : 1) * sizeof(float)>>>(
+      logits, out, stride, start, end, topk);
+  return 0;
+}
+
+extern "C" int sllm_q4_qsa_sparse_attn_dev(const float* q, const float* k,
+                                           const float* v, const int* slots,
+                                           float* out, int nh, int kvh, int hd,
+                                           long kcap, int W, float scale) {
+  if (nh <= 0 || kvh <= 0 || hd <= 0 || kcap <= 0 || W < 0) return -1;
+  if (W > 4096) return -2;  // v1 smem bound (budget+ratio-1 = 2051 fits)
+  qsa_sparse_attn_kernel<<<nh, 256>>>(q, k, v, slots, out, nh, kvh, hd, kcap,
+                                      W, scale);
+  return 0;
+}
+
+extern "C" int sllm_q4_moe_router_dev(const float* logits, float* w_out,
+                                      int* id_out, int n, int E, int topk) {
+  if (n <= 0 || E <= 0 || topk <= 0 || topk > E || E > Q4_MAX_SMEM_ROWS ||
+      topk > 16)
+    return -1;
+  moe_router_kernel<<<n, 256, E * sizeof(float)>>>(logits, w_out, id_out, E,
+                                                   topk);
+  return 0;
+}
+
+extern "C" int sllm_q4_swiglu_dev(const float* g, const float* u, float* out,
+                                  long n) {
+  swiglu_kernel<<<(unsigned)((n + 255) / 256), 256>>>(g, u, out, n);
+  return 0;
+}
+
+extern "C" int sllm_q4_axpy_rows_dev(float* out, const float* y,
+                                     const float* w, int n, int H) {
+  long total = (long)n * H;
+  axpy_rows_kernel<<<(unsigned)((total + 255) / 256), 256>>>(out, y, w, n, H);
+  return 0;
+}
+
+extern "C" int sllm_q4_shared_gate_accum_dev(float* out, const float* shared,
+                                             const float* g, int n, int H) {
+  long total = (long)n * H;
+  shared_gate_kernel<<<(unsigned)((total + 255) / 256), 256>>>(out, shared, g,
+                                                               n, H);
   return 0;
 }

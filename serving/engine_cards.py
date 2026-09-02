@@ -44,7 +44,11 @@ def _backend(model) -> str:
     if isd:
         return "numpy (oracle + device-resident state)"
     if isq:
-        return "numpy (CPU pipeline; GPU kernels are milestone Q4-GPU)"
+        if (getattr(model, "_q4_dev_table", None) is not None
+                and getattr(model, "use_gpu", False)):
+            return (f"gpu (qwen4 device-resident "
+                    f"{getattr(model, 'gpu_dtype', 'fp32')})")
+        return "numpy (CPU pipeline; GPU kernels milestone C1/Q4-GPU)"
     if getattr(model, "placement", "device") == "um":
         return "numpy (host RAM; unified-memory mode)"
     mode = getattr(model, "gpu_mode", "auto")

@@ -15,5 +15,5 @@ NVCC="${NVCC:-nvcc}"
 # NVCC_ARCH accepts either an arch value (native, sm_121) or a full flag
 ARCH="${NVCC_ARCH:-native}"
 [[ "$ARCH" == -* ]] || ARCH="-arch=$ARCH"
-"$NVCC" -O2 "$ARCH" -shared -Xcompiler -fPIC -o sllm_gpu.so kernels.cu qwen4.cu deepseek.cu -lcublas -lcublasLt
+"$NVCC" -O2 "$ARCH" -shared -Xcompiler -fPIC -o sllm_gpu.so kernels.cu qwen4.cu deepseek.cu fp8.cu -lcublas -lcublasLt
 echo "built: $(pwd)/sllm_gpu.so"

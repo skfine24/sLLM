@@ -84,6 +84,9 @@ class ReferenceModel:
         # disables it once and the slower transfer/numpy paths take over.
         self._dev_table = None
         self._resident_off = False
+        # qwen4_exp device-resident weight table (C1); built lazily like
+        # _dev_table. Kept separate: the qwen4 path is its own kernel set.
+        self._q4_dev_table = None
         self._gpu_warned = False
         self._gpu_last_err: Exception | None = None
         # Guards the lazy construction of shared, expensive objects
@@ -192,6 +195,25 @@ class ReferenceModel:
                           stacklevel=2)
             raise
 
+    def _q4_resident_step(self, cache, last_id: int):
+        """qwen4_exp device-resident decode step (C1). The weight table is
+        built once per model; the per-sequence decode state is attached to the
+        Qwen4ExpState cache. On any failure the caller degrades to numpy."""
+        from kernels.q4_device_decode import (Q4DeviceDecodeState,
+                                              Q4DeviceWeightTable)
+        if self._q4_dev_table is None:
+            with self._init_lock:
+                if self._q4_dev_table is None:
+                    table = Q4DeviceWeightTable(
+                        self.weights, self._q4cfg(), dtype=self.gpu_dtype)
+                    self._q4_dev_table = table
+        table = self._q4_dev_table
+        st = getattr(cache, "_q4_dev_state", None)
+        if st is None or st.table is not table:
+            st = Q4DeviceDecodeState(table, cache, self._q4cfg())
+            cache._q4_dev_state = st
+        return st.step(last_id)
+
     def logits(self, ids) -> np.ndarray:
         ids = np.asarray(ids, dtype=np.int64)
         if ids.ndim == 1:
@@ -252,7 +274,18 @@ class ReferenceModel:
         """
         last_id = int(last_id)
         if self._is_q4:
-            # qwen4_exp GPU kernels are milestone Q4-GPU; numpy pipeline only.
+            # qwen4_exp GPU kernels are milestone C1/Q4-GPU. Try the
+            # device-resident path first (weights on GPU, one sync/step);
+            # degrade to the numpy oracle on any failure (the oracle is the
+            # parity reference and is always available).
+            if (self.use_gpu and self._gpu_available()
+                    and os.environ.get("SLLM_GPU_RESIDENT", "1") == "1"):
+                try:
+                    return self._q4_resident_step(cache, last_id)
+                except Exception as _e:  # noqa: BLE001 - degrade, never fail
+                    diag.warn("sllm", f"qwen4 resident decode skipped "
+                                      f"({type(_e).__name__}: {_e}); using "
+                                      f"numpy oracle")
             from ref import qwen4_exp_pipeline as _q4
             return _q4.decode_step(cache, self.weights, self._q4cfg(), last_id)
         if self._is_dsv4:
@@ -690,6 +723,8 @@ class InferenceEngine:
 
     def _vision_args(self, ip):
         vs = getattr(self.model.recipe, "vision", None)
+        fetch_urls = ip._flag("SLLM_VISION_FETCH_URLS")
+        fetch_files = ip._flag("SLLM_VISION_FETCH_FILES")
         if vs is not None and vs.enabled:
             return ip.VisionArgs(
                 patch_size=vs.ds_patch_size or 14,
@@ -697,8 +732,9 @@ class InferenceEngine:
                 max_n_token=vs.max_n_token or 384,
                 min_pixels=vs.min_pixels or 147456,
                 max_wh_ratio=vs.max_wh_ratio if vs.max_wh_ratio is not None
-                else 8.0)
-        return ip.VisionArgs()
+                else 8.0,
+                fetch_urls=fetch_urls, fetch_files=fetch_files)
+        return ip.VisionArgs(fetch_urls=fetch_urls, fetch_files=fetch_files)
 
     def chat(
         self,
@@ -919,11 +955,20 @@ class BatchedInferenceEngine:
             info["sink"] = sink
 
     def abort(self, seq_id: int) -> bool:
-        """Cancel a submitted request (client disconnect)."""
+        """Cancel a submitted request (client disconnect): release its scheduler
+        resources AND complete the sink lifecycle, so a request aborted from
+        either the executor thread (timeout/overflow) or the client side does
+        not leak a slot/thread or leave the sink's done-event unset."""
         if self.sched.abort(seq_id):
             info = self._seqs.get(seq_id)
             if info is not None and info["text"] is None:
                 info["text"] = self.tokenizer.decode(info["gen"])
+            sink = info.get("sink") if info is not None else None
+            if sink is not None:
+                if hasattr(sink, "fail"):
+                    sink.fail(RuntimeError("aborted"))
+                elif hasattr(sink, "on_finish"):
+                    sink.on_finish("abort")
             return True
         return False
 
@@ -1022,6 +1067,13 @@ class BatchedInferenceEngine:
                     elif len(info["gen"]) >= info["max_new"]:
                         self._emit_finish(info, "length")
             else:
+                # Prefill chunk action. NOTE: the incremental reference models
+                # only expose `prefill(full_prompt)` (no incremental append),
+                # so the WHOLE prompt is run on the first prefill action and the
+                # remaining chunk actions are pure scheduler bookkeeping
+                # (position advance). Chunked prefill is therefore
+                # scheduler-level only; true incremental chunked prefill is a
+                # future model-side feature.
                 if self._inc and info["cache"] is None:
                     info["cache"], pl = self.model.prefill(info["prompt"])
                     info["prefill_L"] = pl[0, -1]

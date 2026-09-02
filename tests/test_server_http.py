@@ -113,6 +113,53 @@ class TestHTTPHardening(unittest.TestCase):
         err = self._post_err({"prompt": "hi", "max_tokens": 2})
         self.assertEqual(err.code, 500)
 
+    def test_error_code_field_is_string(self):
+        err = self._post_err({"prompt": "hi", "max_tokens": "abc"})
+        body = json.loads(err.read().decode("utf-8"))
+        self.assertIsInstance(body["error"]["code"], str)
+
+    def test_models_with_query_string(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        try:
+            conn.request("GET", "/v1/models?x=1")
+            resp = conn.getresponse()
+            body = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(body["object"], "list")
+        finally:
+            conn.close()
+
+    def test_health_trailing_slash(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        try:
+            conn.request("GET", "/health/")
+            resp = conn.getresponse()
+            body = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(body["status"], "ok")
+        finally:
+            conn.close()
+
+    def test_connection_cap_returns_503(self):
+        # A saturated server (semaphore full) answers 503 and closes instead of
+        # spawning/holding another handler thread.
+        sem = threading.BoundedSemaphore(1)
+        self.httpd.conn_sem = sem
+        sem.acquire()  # consume the only slot
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+            try:
+                conn.request("GET", "/v1/models")
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 503)
+                self.assertEqual(resp.getheader("Connection"), "close")
+                resp.read()
+            finally:
+                conn.close()
+        finally:
+            sem.release()
+            self.httpd.conn_sem = threading.BoundedSemaphore(64)
+
     def test_saturated_is_429_with_retry_after(self):
         self.engine.complete_exc = SaturatedError("full", retry_after=3)
         err = self._post_err({"prompt": "hi", "max_tokens": 2})

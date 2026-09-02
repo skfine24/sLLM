@@ -2,6 +2,7 @@
 model prefill."""
 
 import io
+import os
 import unittest
 
 import numpy as np
@@ -98,6 +99,51 @@ class TestImageProcessor(unittest.TestCase):
             ip.expand_image_placeholders([64, 64], [{"data": img}],
                                          vocab_size=64,
                                          image_placeholder_id=64)
+
+    def test_remote_url_disabled_by_default(self):
+        # SSRF guard: a client-supplied http(s) URL must be rejected unless
+        # explicitly enabled.
+        with self.assertRaises(ValueError) as ctx:
+            ip.load_image_bytes({"url": "https://example.com/x.png"})
+        self.assertIn("disabled", str(ctx.exception))
+
+    def test_local_file_disabled_by_default(self):
+        # arbitrary file read guard
+        with self.assertRaises(ValueError) as ctx:
+            ip.load_image_bytes({"url": __file__})
+        self.assertIn("disabled", str(ctx.exception))
+
+    def test_remote_url_opt_in_attempts_fetch(self):
+        # fetch_urls=True bypasses the gate; the fetch itself may still fail
+        # (unreachable host) but must NOT raise the "disabled" ValueError.
+        try:
+            ip.load_image_bytes({"url": "https://127.0.0.1:1/x.png"},
+                                fetch_urls=True)
+        except ValueError as exc:
+            self.assertNotIn("disabled", str(exc))
+        except Exception:
+            pass
+
+    def test_local_file_opt_in_reads(self):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".png")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(b"fake-png-bytes")
+            self.assertEqual(ip.load_image_bytes({"url": path},
+                                                 fetch_files=True),
+                             b"fake-png-bytes")
+        finally:
+            os.remove(path)
+
+    def test_env_opt_in_flag_helper(self):
+        os.environ["SLLM_VISION_FETCH_FILES"] = "1"
+        try:
+            self.assertTrue(ip._flag("SLLM_VISION_FETCH_FILES"))
+        finally:
+            del os.environ["SLLM_VISION_FETCH_FILES"]
+        self.assertFalse(ip._flag("SLLM_VISION_FETCH_FILES"))
+        self.assertFalse(ip._flag("SLLM_VISION_FETCH_URLS"))
 
 
 class TestVisionEncoder(unittest.TestCase):

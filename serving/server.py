@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import functools
 import json
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 from env_config import get as _env
 from env_config import get_int as _env_int
@@ -28,7 +30,8 @@ from . import diag
 
 
 def _error(status: int, message: str) -> dict:
-    return {"error": {"message": message, "type": "invalid_request_error", "code": status}}
+    return {"error": {"message": message, "type": "invalid_request_error",
+                      "code": str(status)}}
 
 
 # hard cap on request bodies: an unbounded Content-Length is a trivial DoS
@@ -73,6 +76,39 @@ def _http_logged(method):
 def make_handler(engine: InferenceEngine):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def setup(self):
+            super().setup()
+            # Slow-loris guard: a stalled client must not pin a handler thread
+            # (and its connection slot) forever. The per-connection socket
+            # timeout is server-configurable (SLLM_SOCKET_TIMEOUT, default 60s);
+            # None disables it.
+            t = getattr(self.server, "socket_timeout", None)
+            if t is not None:
+                self.connection.settimeout(t)
+
+        def handle_one_request(self):
+            # Bounded concurrency: a saturated server returns 503 immediately
+            # instead of spawning/holding unbounded handler threads. The
+            # semaphore is held for the whole request (including an SSE stream)
+            # so concurrent in-flight generations stay capped.
+            sem = getattr(self.server, "conn_sem", None)
+            if sem is not None and not sem.acquire(blocking=False):
+                # The request line has not been parsed yet; give the handler the
+                # attributes send_response()/log_request() need, then reject.
+                self.requestline = ""
+                self.command = ""
+                self.request_version = "HTTP/1.1"
+                self._send_json(503, _error(503, "server at capacity"),
+                                close=True)
+                self.close_connection = True
+                self.wfile.flush()
+                return
+            try:
+                super().handle_one_request()
+            finally:
+                if sem is not None:
+                    sem.release()
 
         @property
         def engine(self) -> InferenceEngine:
@@ -142,7 +178,7 @@ def make_handler(engine: InferenceEngine):
                 diag.error("http", f"stream aborted: {type(exc).__name__}: {exc}")
                 try:
                     err = {"error": {"message": f"stream error: {exc}",
-                                     "type": "server_error", "code": 500}}
+                                     "type": "server_error", "code": "500"}}
                     self.wfile.write(
                         ("data: %s\n\n" % json.dumps(err, ensure_ascii=False))
                         .encode("utf-8"))
@@ -202,10 +238,14 @@ def make_handler(engine: InferenceEngine):
 
         @_http_logged
         def do_GET(self):
-            if self.path == "/health":
+            # Match the path component only: ignore a query string and a
+            # trailing slash (/health/, /v1/models?x=1).
+            path = urlsplit(self.path).path
+            path = path.rstrip("/") if path != "/" else "/"
+            if path == "/health":
                 self._send_json(200, {"status": "ok", "model": self.model_name})
                 return
-            if self.path == "/v1/models":
+            if path == "/v1/models":
                 self._send_json(200, {
                     "object": "list",
                     "data": [{"id": self.model_name, "object": "model",
@@ -280,7 +320,7 @@ def make_handler(engine: InferenceEngine):
                 diag.error("http", f"internal error: {type(exc).__name__}: {exc}")
                 self._send_json(500, {"error": {
                     "message": f"internal error: {exc}",
-                    "type": "server_error", "code": 500}})
+                    "type": "server_error", "code": "500"}})
                 return
             self._send_json(200, obj)
 
@@ -381,6 +421,11 @@ def create_server(engine: InferenceEngine, host: str = "127.0.0.1",
     if default_max_new is not None:
         server.default_max_new = int(default_max_new)
     server.started_at = time.time()
+    # Bounded concurrent handlers (SLLM_MAX_CONNECTIONS, default 64) and a
+    # per-connection socket timeout (SLLM_SOCKET_TIMEOUT, default 60s).
+    server.conn_sem = threading.BoundedSemaphore(
+        max(1, _env_int("SLLM_MAX_CONNECTIONS", 64)))
+    server.socket_timeout = _env_int("SLLM_SOCKET_TIMEOUT", 60)
     return server, server.server_address[1]
 
 
